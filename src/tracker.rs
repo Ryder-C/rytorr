@@ -23,16 +23,16 @@ impl fmt::Display for UnrecognizedTrackerError {
 }
 
 pub enum TrackerType {
-    HTTP,
-    UDP,
+    Http,
+    Udp,
 }
 
 impl TrackerType {
     pub fn type_from_url(url: &str) -> Result<Self, UnrecognizedTrackerError> {
         if url.starts_with("http") {
-            Ok(Self::HTTP)
+            Ok(Self::Http)
         } else if url.starts_with("udp") {
-            Ok(Self::UDP)
+            Ok(Self::Udp)
         } else {
             Err(UnrecognizedTrackerError)
         }

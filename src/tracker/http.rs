@@ -33,7 +33,6 @@ impl<'a> Http<'a> {
     pub fn new(url: &'a str, info_hash: &[u8], peer_id: &'a str, port: u16) -> Self {
         let event = Some(EVENT_STARTED);
         let info_hash = encode_binary(info_hash).into_owned();
-        // let info_hash = url_encode_bytes(info_hash).unwrap();
 
         Self {
             url,
@@ -50,9 +49,9 @@ impl<'a> Http<'a> {
 
 impl<'a> Trackable for Http<'a> {
     fn scrape(&mut self) -> Result<TrackerResponse> {
-        let mut request = ureq::get(self.url)
+        let request = ureq::get(self.url)
             .query("info_hash", &self.info_hash)
-            .query("peer_id", &self.peer_id)
+            .query("peer_id", self.peer_id)
             .query("port", &self.port.to_string())
             .query("uploaded", &self.uploaded.to_string())
             .query("downloaded", &self.downloaded.to_string())

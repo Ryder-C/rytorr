@@ -9,7 +9,7 @@ use client::Client;
 #[tokio::main]
 async fn main() {
     // Decode torrent file
-    let torrent = Torrent::new("../Kali.torrent").unwrap();
+    let torrent = Torrent::new("~/Downloads/Ubuntu.torrent").unwrap();
     println!("{:?}", torrent);
     // Build torrent client
     let client = Client::new(torrent, 4444);

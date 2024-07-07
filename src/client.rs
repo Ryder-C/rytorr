@@ -34,8 +34,8 @@ impl Client {
 
     pub fn start_tracking(&self) {
         let announce_list = self.torrent.announce_list.clone();
-        let info_hash = self.torrent.info.hash.clone();
-        let port = self.port.clone();
+        let info_hash = self.torrent.info.hash;
+        let port = self.port;
 
         for url in announce_list {
             let peer_id = self.peer_id.clone();
@@ -66,8 +66,8 @@ impl Client {
         };
 
         let mut tracker = match tracker_type {
-            TrackerType::HTTP => http::Http::new(url, info_hash, peer_id, port),
-            TrackerType::UDP => {
+            TrackerType::Http => http::Http::new(url, info_hash, peer_id, port),
+            TrackerType::Udp => {
                 todo!()
             }
         };
