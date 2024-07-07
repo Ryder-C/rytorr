@@ -1,27 +1,17 @@
-mod constants;
-mod message;
-mod peer;
-mod scheduler;
+mod bencode;
+mod client;
 mod swarm;
-mod torrent_parsing;
-mod tracking;
+mod tracker;
 
-use bendy::decoding::FromBencode;
-use scheduler::Scheduler;
-use std::fs;
-use tokio::time;
-use torrent_parsing::Torrent;
+use bencode::Torrent;
+use client::Client;
 
 #[tokio::main]
 async fn main() {
-    let object = fs::read("example_torrents/debian.iso.torrent").unwrap();
-    let torrent = Torrent::from_bencode(&object).unwrap();
-
-    // Announce to tracker
-    let mut scheduler = Scheduler::new(torrent).await;
-
-    // Schedule occasional requests
-    scheduler.schedule_requests().await;
-
-    time::sleep(time::Duration::from_secs(1000)).await;
+    // Decode torrent file
+    let torrent = Torrent::new("../Kali.torrent").unwrap();
+    println!("{:?}", torrent);
+    // Build torrent client
+    let client = Client::new(torrent, 4444);
+    client.start_tracking();
 }
