@@ -3,9 +3,9 @@ use bendy::decoding::{FromBencode, Object, ResultExt};
 
 #[derive(Debug)]
 pub struct Peer {
-    peer_id: Option<String>,
-    ip: String,
-    port: u16,
+    pub peer_id: Option<String>,
+    pub ip: String,
+    pub port: u16,
 }
 
 impl Peer {
@@ -27,51 +27,5 @@ impl Peer {
             ip,
             port,
         })
-    }
-}
-
-impl FromBencode for Peer {
-    fn decode_bencode_object(
-        object: bendy::decoding::Object,
-    ) -> Result<Self, bendy::decoding::Error>
-    where
-        Self: Sized,
-    {
-        let mut peer_id = None;
-        let mut ip = None;
-        let mut port = None;
-
-        match object {
-            Object::Dict(mut dict) => {
-                while let Some(pair) = dict.next_pair()? {
-                    match pair {
-                        (b"peer id", value) => {
-                            peer_id = String::decode_bencode_object(value)
-                                .context("peer id")
-                                .map(Some)?
-                        }
-                        (b"ip", value) => {
-                            ip = String::decode_bencode_object(value)
-                                .context("ip")
-                                .map(Some)?
-                        }
-                        (b"port", value) => {
-                            port = u16::decode_bencode_object(value)
-                                .context("port")
-                                .map(Some)?
-                        }
-                        _ => {}
-                    }
-                }
-                let ip = ip.ok_or_else(|| bendy::decoding::Error::missing_field("ip"))?;
-                let port = port.ok_or_else(|| bendy::decoding::Error::missing_field("port"))?;
-
-                Ok(Self { peer_id, ip, port })
-            }
-            Object::Bytes(bytes) => Ok(Peer::from_be_bytes(bytes).unwrap()),
-            _ => Err(bendy::decoding::Error::missing_field(
-                "Object::Dict or Object::Bytes",
-            )),
-        }
     }
 }
