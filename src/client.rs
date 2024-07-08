@@ -40,10 +40,12 @@ impl Client {
         for url in announce_list {
             let peer_id = self.peer_id.clone();
             tokio::spawn(async move {
-                loop {
-                    let response = Self::update_tracker(&url, &info_hash, &peer_id, port).unwrap();
+                let mut tracker = Self::create_tracker(url, &info_hash, peer_id, port).unwrap();
 
-                    println!("{:?}", response);
+                loop {
+                    let response = tracker.scrape().unwrap();
+
+                    println!("Recieved response: {:?}", response);
 
                     // Update seeders, leechers, and peers
                     todo!();
@@ -54,24 +56,17 @@ impl Client {
         }
     }
 
-    fn update_tracker(
-        url: &str,
-        info_hash: &[u8],
-        peer_id: &str,
-        port: u16,
-    ) -> Result<TrackerResponse> {
-        let tracker_type = match TrackerType::type_from_url(url) {
+    fn create_tracker(url: String, info_hash: &[u8], peer_id: String, port: u16) -> Result<Box<dyn Trackable>> {
+        let tracker_type = match TrackerType::type_from_url(&url) {
             Ok(typ) => typ,
             Err(_) => bail!("Unknown tracker protocol"),
         };
 
-        let mut tracker = match tracker_type {
-            TrackerType::Http => http::Http::new(url, info_hash, peer_id, port),
+        Ok(match tracker_type {
+            TrackerType::Http => Box::new(http::Http::new(url, info_hash, peer_id, port)),
             TrackerType::Udp => {
                 todo!()
             }
-        };
-
-        tracker.scrape()
+        })
     }
 }
