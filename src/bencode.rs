@@ -230,11 +230,27 @@ impl FromBencode for HttpResponse {
                         .map(Some)?
                 }
                 (b"peers", value) => {
-                    let mut raw_peer_list = value.try_into_list()?;
-
-                    while let Some(raw_peer) = raw_peer_list.next_object()? {
-                        let peer = Peer::decode_bencode_object(raw_peer).context("peer")?;
-                        peers.push(peer);
+                    // Peers can come as bencoded List of Dictionaries OR stream of bytes
+                    match value {
+                        Object::List(mut raw_peer_list) => {
+                            while let Some(raw_peer) = raw_peer_list.next_object()? {
+                                let peer = Peer::decode_bencode_object(raw_peer).context("peer dictionary")?;
+                                peers.push(peer);
+                            }
+                        }
+                        Object::Bytes(raw_peer_bytes) => {
+                            for raw_peer in raw_peer_bytes.chunks(6) {
+                                peers.push(
+                                    match Peer::from_be_bytes(raw_peer) {
+                                        Ok(peer) => peer,
+                                        Err(_) => continue,
+                                    }
+                                );
+                            }
+                        }
+                        _ => return Err(bendy::decoding::Error::missing_field(
+                            "Object::Dict or Object::Bytes",
+                        )),
                     }
                 }
                 _ => {}
@@ -265,37 +281,31 @@ impl FromBencode for Peer {
         let mut ip = None;
         let mut port = None;
 
-        match object {
-            Object::Dict(mut dict) => {
-                while let Some(pair) = dict.next_pair()? {
-                    match pair {
-                        (b"peer id", value) => {
-                            peer_id = String::decode_bencode_object(value)
-                                .context("peer id")
-                                .map(Some)?
-                        }
-                        (b"ip", value) => {
-                            ip = String::decode_bencode_object(value)
-                                .context("ip")
-                                .map(Some)?
-                        }
-                        (b"port", value) => {
-                            port = u16::decode_bencode_object(value)
-                                .context("port")
-                                .map(Some)?
-                        }
-                        _ => {}
-                    }
-                }
-                let ip = ip.ok_or_else(|| bendy::decoding::Error::missing_field("ip"))?;
-                let port = port.ok_or_else(|| bendy::decoding::Error::missing_field("port"))?;
+        let mut dict = object.try_into_dictionary()?;
 
-                Ok(Self { peer_id, ip, port })
+        while let Some(pair) = dict.next_pair()? {
+            match pair {
+                (b"peer id", value) => {
+                    peer_id = String::decode_bencode_object(value)
+                        .context("peer id")
+                        .map(Some)?
+                }
+                (b"ip", value) => {
+                    ip = String::decode_bencode_object(value)
+                        .context("ip")
+                        .map(Some)?
+                }
+                (b"port", value) => {
+                    port = u16::decode_bencode_object(value)
+                        .context("port")
+                        .map(Some)?
+                }
+                _ => {}
             }
-            Object::Bytes(bytes) => Ok(Peer::from_be_bytes(bytes).unwrap()),
-            _ => Err(bendy::decoding::Error::missing_field(
-                "Object::Dict or Object::Bytes",
-            )),
         }
+        let ip = ip.ok_or_else(|| bendy::decoding::Error::missing_field("ip"))?;
+        let port = port.ok_or_else(|| bendy::decoding::Error::missing_field("port"))?;
+
+        Ok(Self { peer_id, ip, port })
     }
 }

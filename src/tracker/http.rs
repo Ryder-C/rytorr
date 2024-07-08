@@ -53,7 +53,6 @@ impl<'a> Trackable for Http<'a> {
         let request_url = format!("{}?info_hash={}", self.url, &self.info_hash);
 
         let request = ureq::get(&request_url)
-            // .query("info_hash", &self.info_hash)
             .query("peer_id", self.peer_id)
             .query("port", &self.port.to_string())
             .query("uploaded", &self.uploaded.to_string())
