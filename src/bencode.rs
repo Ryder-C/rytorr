@@ -234,23 +234,24 @@ impl FromBencode for HttpResponse {
                     match value {
                         Object::List(mut raw_peer_list) => {
                             while let Some(raw_peer) = raw_peer_list.next_object()? {
-                                let peer = Peer::decode_bencode_object(raw_peer).context("peer dictionary")?;
+                                let peer = Peer::decode_bencode_object(raw_peer)
+                                    .context("peer dictionary")?;
                                 peers.push(peer);
                             }
                         }
                         Object::Bytes(raw_peer_bytes) => {
                             for raw_peer in raw_peer_bytes.chunks(6) {
-                                peers.push(
-                                    match Peer::from_be_bytes(raw_peer) {
-                                        Ok(peer) => peer,
-                                        Err(_) => continue,
-                                    }
-                                );
+                                peers.push(match Peer::from_be_bytes(raw_peer) {
+                                    Ok(peer) => peer,
+                                    Err(_) => continue,
+                                });
                             }
                         }
-                        _ => return Err(bendy::decoding::Error::missing_field(
-                            "Object::Dict or Object::Bytes",
-                        )),
+                        _ => {
+                            return Err(bendy::decoding::Error::missing_field(
+                                "Object::Dict or Object::Bytes",
+                            ))
+                        }
                     }
                 }
                 _ => {}

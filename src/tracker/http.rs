@@ -2,7 +2,7 @@ use crate::swarm::Peer;
 
 use super::{Trackable, TrackerResponse, EVENT_STARTED};
 use anyhow::{bail, Result};
-use bendy::decoding::{FromBencode, ResultExt};
+use bendy::decoding::FromBencode;
 use urlencoding::encode_binary;
 
 // Tracker parameters from bittorrent spec <https://wiki.theory.org/BitTorrentSpecification#Tracker_HTTP.2FHTTPS_Protocol>

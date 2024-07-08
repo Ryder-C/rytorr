@@ -1,5 +1,4 @@
 use anyhow::{ensure, Result};
-use bendy::decoding::{FromBencode, Object, ResultExt};
 
 #[derive(Debug)]
 pub struct Peer {
