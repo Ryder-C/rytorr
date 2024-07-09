@@ -11,6 +11,8 @@ const EVENT_STARTED: &str = "Started";
 const EVENT_STOPPED: &str = "Stopped";
 const EVENT_COMPLETED: &str = "Completed";
 
+const MAX_PEERS: usize = 50;
+
 #[derive(Debug)]
 pub struct UnrecognizedTrackerError;
 
@@ -49,6 +51,12 @@ pub struct TrackerResponse {
     leechers: Option<u32>,
     seeders: Option<u32>,
     peers: Vec<Peer>,
+}
+
+impl TrackerResponse {
+    pub fn from_udp_response(response: &[u8]) -> Result<Self> {
+        todo!()
+    }
 }
 
 impl TryFrom<HttpResponse> for TrackerResponse {

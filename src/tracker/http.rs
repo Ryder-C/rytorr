@@ -1,4 +1,4 @@
-use crate::swarm::Peer;
+use crate::{swarm::Peer, tracker::MAX_PEERS};
 
 use super::{Trackable, TrackerResponse};
 use anyhow::{bail, Result};
@@ -62,7 +62,7 @@ impl<'a> Trackable for Http<'a> {
             .query("downloaded", &self.downloaded.to_string())
             .query("left", &self.left.to_string())
             .query("compact", "1")
-            .query("numwant", "50");
+            .query("numwant", &MAX_PEERS.to_string());
 
         if let Some(event) = self.event {
             request = request.query("event", event);

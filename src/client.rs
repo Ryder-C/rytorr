@@ -56,7 +56,12 @@ impl Client {
         }
     }
 
-    fn create_tracker(url: String, info_hash: &[u8], peer_id: String, port: u16) -> Result<Box<dyn Trackable>> {
+    fn create_tracker(
+        url: String,
+        info_hash: &[u8],
+        peer_id: String,
+        port: u16,
+    ) -> Result<Box<dyn Trackable>> {
         let tracker_type = match TrackerType::type_from_url(&url) {
             Ok(typ) => typ,
             Err(_) => bail!("Unknown tracker protocol"),
