@@ -2,7 +2,7 @@ use std::{thread, time::Duration};
 
 use crate::{
     bencode::Torrent,
-    tracker::{http, Trackable, TrackerResponse, TrackerType},
+    tracker::{http, Trackable, TrackerType},
 };
 use anyhow::{bail, Result};
 use rand::{distributions, Rng};
@@ -48,7 +48,7 @@ impl Client {
                     println!("Recieved response: {:?}", response);
 
                     // Update seeders, leechers, and peers
-                    todo!();
+                    // todo!();
 
                     thread::sleep(Duration::from_secs(response.interval));
                 }

@@ -262,7 +262,7 @@ impl FromBencode for HttpResponse {
             failure_reason,
             warning_message,
             interval,
-            min_interval,
+            _min_interval: min_interval,
             tracker_id,
             seeders,
             leechers,

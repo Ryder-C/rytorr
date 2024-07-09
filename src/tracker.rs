@@ -46,8 +46,8 @@ pub trait Trackable {
 #[derive(Debug)]
 pub struct TrackerResponse {
     pub interval: u64,
-    leechers: u32,
-    seeders: u32,
+    leechers: Option<u32>,
+    seeders: Option<u32>,
     peers: Vec<Peer>,
 }
 
@@ -56,8 +56,8 @@ impl TryFrom<HttpResponse> for TrackerResponse {
 
     fn try_from(value: HttpResponse) -> std::result::Result<Self, Self::Error> {
         let interval = value.interval.context("interval not found")?;
-        let leechers = value.leechers.context("leechers not found")?;
-        let seeders = value.seeders.context("seeders not found")?;
+        let leechers = value.leechers;
+        let seeders = value.seeders;
         let peers = value.peers;
 
         Ok(Self {

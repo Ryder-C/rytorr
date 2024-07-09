@@ -19,11 +19,12 @@ pub struct Http<'a> {
     tracker_id: Option<String>,
 }
 
+#[derive(Debug)]
 pub struct HttpResponse {
     pub failure_reason: Option<String>,
     pub warning_message: Option<String>,
     pub interval: Option<u64>,
-    pub min_interval: Option<u32>,
+    pub _min_interval: Option<u32>,
     pub tracker_id: Option<String>,
     pub seeders: Option<u32>,
     pub leechers: Option<u32>,
@@ -60,7 +61,8 @@ impl<'a> Trackable for Http<'a> {
             .query("uploaded", &self.uploaded.to_string())
             .query("downloaded", &self.downloaded.to_string())
             .query("left", &self.left.to_string())
-            .query("compact", "1");
+            .query("compact", "1")
+            .query("numwant", "50");
 
         if let Some(event) = self.event {
             request = request.query("event", event);
@@ -68,10 +70,8 @@ impl<'a> Trackable for Http<'a> {
         }
 
         if let Some(tracker_id) = &self.tracker_id {
-            request = request.query("tracker id", tracker_id);
+            request = request.query("trackerid", tracker_id);
         }
-        
-        println!("Requesting... {:?}", request);
 
         let mut bytes = vec![];
         request.call()?.into_reader().read_to_end(&mut bytes)?;
@@ -87,8 +87,10 @@ impl<'a> Trackable for Http<'a> {
         }
 
         if let Some(message) = &response.warning_message {
-            println!("Tracker Warning: {:?}", message);
+            println!("Tracker Warning: {}", message);
         }
+
+        println!("Response: {:?}", response);
 
         self.tracker_id = response.tracker_id.clone();
 

@@ -8,14 +8,6 @@ pub struct Peer {
 }
 
 impl Peer {
-    pub fn new(peer_id: String, ip: String, port: u16) -> Self {
-        Self {
-            peer_id: Some(peer_id),
-            ip,
-            port,
-        }
-    }
-
     pub fn from_be_bytes(bytes: &[u8]) -> Result<Self> {
         ensure!(bytes.len() == 6, "can only decode peer from 6 bytes");
 
