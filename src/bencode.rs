@@ -205,7 +205,7 @@ impl FromBencode for HttpResponse {
                         .map(Some)?
                 }
                 (b"interval", value) => {
-                    interval = u64::decode_bencode_object(value)
+                    interval = u32::decode_bencode_object(value)
                         .context("interval")
                         .map(Some)?
                 }

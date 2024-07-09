@@ -23,7 +23,7 @@ pub struct Http<'a> {
 pub struct HttpResponse {
     pub failure_reason: Option<String>,
     pub warning_message: Option<String>,
-    pub interval: Option<u64>,
+    pub interval: Option<u32>,
     pub _min_interval: Option<u32>,
     pub tracker_id: Option<String>,
     pub seeders: Option<u32>,

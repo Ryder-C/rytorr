@@ -2,7 +2,7 @@ use std::{thread, time::Duration};
 
 use crate::{
     bencode::Torrent,
-    tracker::{http, Trackable, TrackerType},
+    tracker::{http, udp, Trackable, TrackerType},
 };
 use anyhow::{bail, Result};
 use rand::{distributions, Rng};
@@ -40,7 +40,7 @@ impl Client {
         for url in announce_list {
             let peer_id = self.peer_id.clone();
             tokio::spawn(async move {
-                let mut tracker = Self::create_tracker(url, &info_hash, peer_id, port).unwrap();
+                let mut tracker = Self::create_tracker(url, info_hash, peer_id, port).unwrap();
 
                 loop {
                     let response = tracker.scrape().unwrap();
@@ -50,7 +50,7 @@ impl Client {
                     // Update seeders, leechers, and peers
                     // todo!();
 
-                    thread::sleep(Duration::from_secs(response.interval));
+                    thread::sleep(Duration::from_secs(response.interval as u64));
                 }
             });
         }
@@ -58,7 +58,7 @@ impl Client {
 
     fn create_tracker(
         url: String,
-        info_hash: &[u8],
+        info_hash: [u8; 20],
         peer_id: String,
         port: u16,
     ) -> Result<Box<dyn Trackable>> {
@@ -68,10 +68,8 @@ impl Client {
         };
 
         Ok(match tracker_type {
-            TrackerType::Http => Box::new(http::Http::new(url, info_hash, peer_id, port)),
-            TrackerType::Udp => {
-                todo!()
-            }
+            TrackerType::Http => Box::new(http::Http::new(url, &info_hash, peer_id, port)),
+            TrackerType::Udp => Box::new(udp::Udp::new(url, info_hash, peer_id, port)?)
         })
     }
 }

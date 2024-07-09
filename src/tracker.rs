@@ -1,6 +1,7 @@
 use anyhow::{bail, Context, Result};
 use http::HttpResponse;
 use std::fmt;
+use udp::Udp;
 
 use crate::swarm::Peer;
 
@@ -47,15 +48,37 @@ pub trait Trackable {
 
 #[derive(Debug)]
 pub struct TrackerResponse {
-    pub interval: u64,
+    pub interval: u32,
     leechers: Option<u32>,
     seeders: Option<u32>,
     peers: Vec<Peer>,
 }
 
 impl TrackerResponse {
-    pub fn from_udp_response(response: &[u8]) -> Result<Self> {
-        todo!()
+    pub fn from_udp_response(response: &[u8], transaction_id: u32) -> Result<Self> {
+        if transaction_id != u32::from_be_bytes(response[4..8].try_into()?) {
+            bail!("Transaction ID Mismatch")
+        }
+
+        if 1 != u32::from_be_bytes(response[0..4].try_into()?) {
+            bail!("Recieved Action not Announce")
+        }
+
+        let interval = u32::from_be_bytes(response[8..12].try_into()?);
+        let leechers = Some(u32::from_be_bytes(response[12..16].try_into()?));
+        let seeders = Some(u32::from_be_bytes(response[16..20].try_into()?));
+        let peers = response[20..]
+            .chunks(6)
+            .map(Peer::from_be_bytes)
+            .filter_map(|x| x.ok())
+            .collect();
+
+        Ok(Self {
+            interval,
+            leechers,
+            seeders,
+            peers,
+        })
     }
 }
 
