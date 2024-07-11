@@ -90,8 +90,6 @@ impl<'a> Trackable for Http<'a> {
             println!("Tracker Warning: {}", message);
         }
 
-        println!("Response: {:?}", response);
-
         self.tracker_id = response.tracker_id.clone();
 
         response.try_into()

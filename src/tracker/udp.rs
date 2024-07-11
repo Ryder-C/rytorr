@@ -98,7 +98,7 @@ impl Trackable for Udp {
         buf[80..84].copy_from_slice(&0u32.to_be_bytes()); // Event = 0 for none (for now)
         buf[84..88].copy_from_slice(&0u32.to_be_bytes()); // IP address = 0 for default
         buf[88..92].copy_from_slice(&0u32.to_be_bytes()); // Key = 0 for default
-        buf[92..96].copy_from_slice(&MAX_PEERS.to_be_bytes()); // Num want = -1 for default
+        buf[92..96].copy_from_slice(&(MAX_PEERS as u32).to_be_bytes()); // Num want = -1 for default
         buf[96..98].copy_from_slice(&self.port.to_be_bytes());
 
         self.socket.send(&buf)?;

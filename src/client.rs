@@ -69,7 +69,7 @@ impl Client {
 
         Ok(match tracker_type {
             TrackerType::Http => Box::new(http::Http::new(url, &info_hash, peer_id, port)),
-            TrackerType::Udp => Box::new(udp::Udp::new(url, info_hash, peer_id, port)?)
+            TrackerType::Udp => Box::new(udp::Udp::new(url, info_hash, peer_id, port)?),
         })
     }
 }
