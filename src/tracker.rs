@@ -42,7 +42,8 @@ impl TrackerType {
     }
 }
 
-pub trait Trackable {
+pub trait Trackable: Send + Sync {
+    fn update_progress(&mut self, downloaded: u64, uploaded: u64);
     fn scrape(&mut self) -> Result<TrackerResponse>;
 }
 

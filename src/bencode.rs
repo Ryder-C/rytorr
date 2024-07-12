@@ -21,13 +21,13 @@ pub struct Torrent {
 #[derive(Debug, Default)]
 pub struct Info {
     name: String,
-    files: Vec<File>,
+    pub files: Vec<File>,
     pub hash: [u8; 20],
 }
 
 #[derive(Debug)]
-struct File {
-    length: i64,
+pub struct File {
+    pub length: u64,
     md5sum: Option<String>,
     path: PathBuf,
 }
@@ -111,7 +111,7 @@ impl FromBencode for Info {
             match pair {
                 (b"name", value) => name = Some(String::decode_bencode_object(value)?),
                 (b"files", value) => files = Some(Vec::decode_bencode_object(value)?),
-                (b"length", value) => length = Some(i64::decode_bencode_object(value)?),
+                (b"length", value) => length = Some(u64::decode_bencode_object(value)?),
                 (b"md5sum", value) => md5sum = Some(String::decode_bencode_object(value)?),
                 _ => {}
             }
@@ -151,7 +151,7 @@ impl FromBencode for File {
         let mut dict = object.try_into_dictionary()?;
         while let Some(pair) = dict.next_pair()? {
             match pair {
-                (b"length", value) => length = Some(i64::decode_bencode_object(value)?),
+                (b"length", value) => length = Some(u64::decode_bencode_object(value)?),
                 (b"md5sum", value) => md5sum = Some(String::decode_bencode_object(value)?),
                 (b"path", value) => {
                     path = Vec::decode_bencode_object(value)?

@@ -11,7 +11,7 @@ pub struct Udp {
     peer_id: String,
     uploaded: u64,
     downloaded: u64,
-    left: u64,
+    size: u64,
     connection_id: u64,
     socket: UdpSocket,
     address: SocketAddr,
@@ -22,7 +22,7 @@ impl Udp {
     const PROTOCOL_ID: u64 = 0x41727101980;
     const MAX_RESPONSE_SIZE: usize = 20 + 6 * MAX_PEERS;
 
-    pub fn new(url: String, info_hash: [u8; 20], peer_id: String, port: u16) -> Result<Self> {
+    pub fn new(url: String, info_hash: [u8; 20], peer_id: String, port: u16, size: u64) -> Result<Self> {
         let socket = UdpSocket::bind("0.0.0.0:0")?;
         let address = Self::parse_url(&url)?;
 
@@ -35,7 +35,7 @@ impl Udp {
             peer_id,
             uploaded: 0,
             downloaded: 0,
-            left: 0,
+            size,
             connection_id,
             socket,
             address,
@@ -93,7 +93,7 @@ impl Trackable for Udp {
         buf[16..36].copy_from_slice(&self.info_hash);
         buf[36..56].copy_from_slice(&self.peer_id.as_bytes());
         buf[56..64].copy_from_slice(&self.downloaded.to_be_bytes());
-        buf[64..72].copy_from_slice(&self.left.to_be_bytes());
+        buf[64..72].copy_from_slice(&(self.size - self.downloaded).to_be_bytes());
         buf[72..80].copy_from_slice(&self.uploaded.to_be_bytes());
         buf[80..84].copy_from_slice(&0u32.to_be_bytes()); // Event = 0 for none (for now)
         buf[84..88].copy_from_slice(&0u32.to_be_bytes()); // IP address = 0 for default
@@ -107,5 +107,10 @@ impl Trackable for Udp {
         self.socket.recv(&mut buf)?;
 
         Ok(TrackerResponse::from_udp_response(&buf, transaction_id)?)
+    }
+    
+    fn update_progress(&mut self, downloaded: u64, uploaded: u64) {
+        self.downloaded = downloaded;
+        self.uploaded = uploaded;
     }
 }

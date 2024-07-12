@@ -13,7 +13,7 @@ pub struct Http<'a> {
     port: u16,
     uploaded: u64,
     downloaded: u64,
-    left: u64,
+    size: u64,
     // Compact always 1
     event: Option<&'a str>,
     tracker_id: Option<String>,
@@ -32,7 +32,7 @@ pub struct HttpResponse {
 }
 
 impl<'a> Http<'a> {
-    pub fn new(url: String, info_hash: &[u8], peer_id: String, port: u16) -> Self {
+    pub fn new(url: String, info_hash: &[u8], peer_id: String, port: u16, size: u64) -> Self {
         let event = None; // Some(EVENT_STARTED);
         let info_hash = encode_binary(info_hash).into_owned();
 
@@ -43,7 +43,7 @@ impl<'a> Http<'a> {
             port,
             uploaded: 0,
             downloaded: 0,
-            left: 0,
+            size,
             event,
             tracker_id: None,
         }
@@ -60,7 +60,7 @@ impl<'a> Trackable for Http<'a> {
             .query("port", &self.port.to_string())
             .query("uploaded", &self.uploaded.to_string())
             .query("downloaded", &self.downloaded.to_string())
-            .query("left", &self.left.to_string())
+            .query("left", &(self.size - self.downloaded).to_string())
             .query("compact", "1")
             .query("numwant", &MAX_PEERS.to_string());
 
@@ -93,5 +93,10 @@ impl<'a> Trackable for Http<'a> {
         self.tracker_id = response.tracker_id.clone();
 
         response.try_into()
+    }
+    
+    fn update_progress(&mut self, downloaded: u64, uploaded: u64) {
+        self.downloaded = downloaded;
+        self.uploaded = uploaded;
     }
 }
