@@ -1,16 +1,11 @@
 use anyhow::{bail, Context, Result};
 use http::HttpResponse;
-use std::fmt;
-use udp::Udp;
+use std::fmt::{self, Display};
 
 use crate::swarm::Peer;
 
 pub mod http;
 pub mod udp;
-
-const EVENT_STARTED: &str = "Started";
-const EVENT_STOPPED: &str = "Stopped";
-const EVENT_COMPLETED: &str = "Completed";
 
 const MAX_PEERS: usize = 50;
 
@@ -22,6 +17,27 @@ impl std::error::Error for UnrecognizedTrackerError {}
 impl fmt::Display for UnrecognizedTrackerError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         write!(f, "Unrecognized tracker protocol")
+    }
+}
+
+#[derive(Debug, Clone)]
+pub enum Event {
+    Started,
+    Stopped,
+    Completed,
+}
+
+impl Display for Event {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(
+            f,
+            "{}",
+            match self {
+                Self::Started => "Started",
+                Self::Stopped => "Stopped",
+                Self::Completed => "Completed",
+            }
+        )
     }
 }
 

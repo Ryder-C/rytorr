@@ -90,11 +90,11 @@ impl<'a> Trackable for Http<'a> {
             println!("Tracker Warning: {}", message);
         }
 
-        self.tracker_id = response.tracker_id.clone();
+        self.tracker_id.clone_from(&response.tracker_id);
 
         response.try_into()
     }
-    
+
     fn update_progress(&mut self, downloaded: u64, uploaded: u64) {
         self.downloaded = downloaded;
         self.uploaded = uploaded;

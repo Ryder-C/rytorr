@@ -52,7 +52,8 @@ impl Client {
             let uploaded = self.uploaded.clone();
 
             tokio::spawn(async move {
-                let mut tracker = Self::create_tracker(url, info_hash, peer_id, port, size).unwrap();
+                let mut tracker =
+                    Self::create_tracker(url, info_hash, peer_id, port, size).unwrap();
 
                 loop {
                     tracker.update_progress(*downloaded.read().await, *uploaded.read().await);
