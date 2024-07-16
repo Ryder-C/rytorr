@@ -7,7 +7,7 @@ use crate::tracker::TrackerResponse;
 
 // Implemented according to Bep_15 <https://www.bittorrent.org/beps/bep_0015.html>
 pub struct Udp {
-    info_hash: [u8; 20],
+    info_hash: &'static [u8],
     peer_id: String,
     uploaded: u64,
     downloaded: u64,
@@ -23,7 +23,7 @@ impl Udp {
 
     pub fn new(
         url: String,
-        info_hash: [u8; 20],
+        info_hash: &'static [u8],
         peer_id: String,
         port: u16,
         size: u64,
@@ -94,7 +94,7 @@ impl Trackable for Udp {
         buf[0..8].copy_from_slice(&self.connection_id.to_be_bytes());
         buf[8..12].copy_from_slice(&1u32.to_be_bytes()); // Action = 1 for announce
         buf[12..16].copy_from_slice(&transaction_id.to_be_bytes());
-        buf[16..36].copy_from_slice(&self.info_hash);
+        buf[16..36].copy_from_slice(self.info_hash);
         buf[36..56].copy_from_slice(self.peer_id.as_bytes());
         buf[56..64].copy_from_slice(&self.downloaded.to_be_bytes());
         buf[64..72].copy_from_slice(&(self.size - self.downloaded).to_be_bytes());

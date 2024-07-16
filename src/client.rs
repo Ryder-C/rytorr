@@ -3,13 +3,15 @@ use tokio::sync::RwLock;
 
 use crate::{
     bencode::Torrent,
+    swarm::Swarm,
     tracker::{http, udp, Trackable, TrackerType},
 };
 use anyhow::{bail, Result};
 use rand::{distributions, Rng};
 
 pub struct Client {
-    torrent: Torrent,
+    torrent: &'static Torrent,
+    swarm: Swarm,
     peer_id: String,
     port: u16,
     downloaded: Arc<RwLock<u64>>,
@@ -18,11 +20,12 @@ pub struct Client {
 }
 
 impl Client {
-    pub fn new(torrent: Torrent, port: u16) -> Self {
+    pub fn new(torrent: &'static Torrent, port: u16) -> Self {
         let peer_id = Self::generate_peer_id();
         let size = torrent.info.files.iter().map(|f| f.length).sum();
         Self {
             torrent,
+            swarm: Swarm::new(),
             peer_id,
             port,
             downloaded: Arc::new(RwLock::new(0)),
@@ -42,7 +45,7 @@ impl Client {
 
     pub fn start_tracking(&self) {
         let announce_list = self.torrent.announce_list.clone();
-        let info_hash = self.torrent.info.hash;
+        let info_hash = &self.torrent.info.hash;
         let port = self.port;
         let size = self.size;
 
@@ -72,7 +75,7 @@ impl Client {
 
     fn create_tracker(
         url: String,
-        info_hash: [u8; 20],
+        info_hash: &'static [u8],
         peer_id: String,
         port: u16,
         size: u64,
@@ -83,7 +86,7 @@ impl Client {
         };
 
         Ok(match tracker_type {
-            TrackerType::Http => Box::new(http::Http::new(url, &info_hash, peer_id, port, size)),
+            TrackerType::Http => Box::new(http::Http::new(url, info_hash, peer_id, port, size)),
             TrackerType::Udp => Box::new(udp::Udp::new(url, info_hash, peer_id, port, size)?),
         })
     }

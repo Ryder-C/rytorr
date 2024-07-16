@@ -2,7 +2,7 @@ use anyhow::{bail, Context, Result};
 use http::HttpResponse;
 use std::fmt::{self, Display};
 
-use crate::swarm::Peer;
+use crate::peer::Peer;
 
 pub mod http;
 pub mod udp;

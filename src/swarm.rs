@@ -1,22 +1,20 @@
-use anyhow::{ensure, Result};
+use async_channel::{self, Receiver, Sender};
 
-#[derive(Debug)]
-pub struct Peer {
-    pub peer_id: Option<String>,
-    pub ip: String,
-    pub port: u16,
+use crate::{file::Piece, peer::Peer};
+
+pub struct Swarm {
+    channel: (Sender<Piece>, Receiver<Piece>),
 }
 
-impl Peer {
-    pub fn from_be_bytes(bytes: &[u8]) -> Result<Self> {
-        ensure!(bytes.len() == 6, "can only decode peer from 6 bytes");
+impl Swarm {
+    pub fn new() -> Self {
+        Self {
+            channel: async_channel::unbounded(),
+        }
+    }
 
-        let ip = format!("{}.{}.{}.{}", bytes[0], bytes[1], bytes[2], bytes[3]);
-        let port = u16::from_be_bytes([bytes[4], bytes[5]]);
-        Ok(Self {
-            peer_id: None,
-            ip,
-            port,
-        })
+    pub fn introduce_peer(&self, peer: Peer) {
+        let reciever = self.channel.1.clone();
+        tokio::spawn(async move {});
     }
 }

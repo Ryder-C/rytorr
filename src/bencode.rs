@@ -4,7 +4,7 @@ use bendy::decoding::{FromBencode, Object, ResultExt};
 use chrono::{DateTime, Local, TimeZone};
 use sha1::{Digest, Sha1};
 
-use crate::{swarm::Peer, tracker::http::HttpResponse};
+use crate::{peer::Peer, tracker::http::HttpResponse};
 
 type BendyResult<T> = Result<T, bendy::decoding::Error>;
 
