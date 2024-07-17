@@ -1,11 +1,12 @@
 mod message;
 
-use std::net::TcpStream;
+use std::{hash::Hash, net::TcpStream, sync::Arc};
 
 use anyhow::{ensure, Context, Result};
 use bit_vec::BitVec;
+use tokio::sync::Mutex;
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct Peer {
     pub peer_id: Option<String>,
     pub ip: String,
@@ -23,6 +24,21 @@ impl Peer {
             ip,
             port,
         })
+    }
+}
+
+impl PartialEq for Peer {
+    fn eq(&self, other: &Self) -> bool {
+        self.ip == other.ip && self.port == other.port
+    }
+}
+
+impl Eq for Peer {}
+
+impl Hash for Peer {
+    fn hash<H: std::hash::Hasher>(&self, state: &mut H) {
+        self.ip.hash(state);
+        self.port.hash(state);
     }
 }
 
@@ -51,6 +67,4 @@ impl PeerConnection {
             peer_interested: false,
         })
     }
-
-
 }

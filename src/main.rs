@@ -10,9 +10,7 @@ use client::Client;
 use once_cell::sync::Lazy;
 
 // Decode torrent file
-static TORRENT: Lazy<Torrent> = Lazy::new(|| {
-    Torrent::new("~/Downloads/Kali.torrent").unwrap()
-});
+static TORRENT: Lazy<Torrent> = Lazy::new(|| Torrent::new("~/Downloads/Kali.torrent").unwrap());
 
 #[tokio::main]
 async fn main() {

@@ -66,9 +66,9 @@ pub trait Trackable: Send + Sync {
 #[derive(Debug)]
 pub struct TrackerResponse {
     pub interval: u32,
-    leechers: Option<u32>,
-    seeders: Option<u32>,
-    peers: Vec<Peer>,
+    pub leechers: Option<u32>,
+    pub seeders: Option<u32>,
+    pub peers: Vec<Peer>,
 }
 
 impl TrackerResponse {

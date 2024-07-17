@@ -32,7 +32,13 @@ pub struct HttpResponse {
 }
 
 impl<'a> Http<'a> {
-    pub fn new(url: String, info_hash: &'static [u8], peer_id: String, port: u16, size: u64) -> Self {
+    pub fn new(
+        url: String,
+        info_hash: &'static [u8],
+        peer_id: String,
+        port: u16,
+        size: u64,
+    ) -> Self {
         let event = None; // Some(EVENT_STARTED);
         let info_hash = encode_binary(info_hash).into_owned();
 
