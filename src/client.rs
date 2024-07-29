@@ -1,7 +1,10 @@
 use std::{sync::Arc, thread, time::Duration};
-use tokio::sync::{
-    mpsc::{self, Receiver, Sender},
-    Mutex, RwLock,
+use tokio::{
+    net::TcpStream,
+    sync::{
+        mpsc::{self, Receiver, Sender},
+        Mutex, RwLock,
+    },
 };
 
 use crate::{
@@ -13,9 +16,14 @@ use crate::{
 use anyhow::{bail, Result};
 use rand::{distributions, Rng};
 
+pub enum PendingPeer {
+    Outgoing(Peer),
+    Incoming(Peer, TcpStream),
+}
+
 pub struct Client {
     torrent: &'static Torrent,
-    peer_sender: Sender<Vec<Peer>>,
+    peer_sender: Sender<PendingPeer>,
     peer_id: String,
     port: u16,
     downloaded: Arc<RwLock<u64>>,
@@ -32,7 +40,13 @@ impl Client {
 
         // Peer communication channel buffer size of number of trackers
         let (peer_sender, peer_reciever) = mpsc::channel(torrent.announce_list.len());
-        Self::start_swarm(peer_reciever);
+        Self::start_swarm(
+            peer_sender.clone(),
+            peer_reciever,
+            peer_id.clone(),
+            &torrent.info.hash,
+            port,
+        );
 
         Self {
             torrent,
@@ -56,10 +70,19 @@ impl Client {
         peer_id
     }
 
-    pub fn start_swarm(reciever: Receiver<Vec<Peer>>) {
+    pub fn start_swarm(
+        sender: Sender<PendingPeer>,
+        reciever: Receiver<PendingPeer>,
+        peer_id: String,
+        info_hash: &'static [u8],
+        port: u16,
+    ) {
         tokio::spawn(async move {
-            let mut swarm = Swarm::new(reciever);
-            swarm.start().await;
+            let mut swarm = Swarm::new(reciever, peer_id);
+
+            tokio::spawn(Swarm::listen_for_peers(sender, port));
+
+            swarm.start(info_hash).await; // Loops indefinitely
         });
     }
 
@@ -88,7 +111,10 @@ impl Client {
                     println!("Recieved response: {:?}", response);
 
                     // Update seeders, leechers, and peers
-                    sender.send(response.peers).await.unwrap();
+                    for peer in response.peers {
+                        sender.send(PendingPeer::Outgoing(peer)).await.unwrap();
+                    }
+                    // sender.send(response.peers).await.unwrap();
                     if let Some(new_seeders) = response.seeders {
                         *seeders.lock().await = new_seeders;
                     }

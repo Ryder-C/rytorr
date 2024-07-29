@@ -1,39 +1,61 @@
-use std::{collections::HashSet, sync::Arc};
+use std::collections::HashSet;
 
+use anyhow::Result;
 use async_channel::{self, Receiver, Sender};
-use tokio::sync::{mpsc, Mutex};
+use tokio::{net::TcpListener, sync::mpsc};
 
-use crate::{file::Piece, peer::Peer};
+use crate::{
+    client::PendingPeer,
+    file::Piece,
+    peer::{Peer, PeerConnection},
+};
 
 pub struct Swarm {
-    peer_reciever: mpsc::Receiver<Vec<Peer>>,
+    peer_reciever: mpsc::Receiver<PendingPeer>,
     channel: (Sender<Piece>, Receiver<Piece>),
     peers: HashSet<Peer>,
+    my_id: String,
 }
 
 impl Swarm {
-    pub fn new(peer_reciever: mpsc::Receiver<Vec<Peer>>) -> Self {
+    pub fn new(peer_reciever: mpsc::Receiver<PendingPeer>, my_id: String) -> Self {
         Self {
             peer_reciever,
             channel: async_channel::unbounded(),
             peers: HashSet::new(),
+            my_id,
         }
     }
 
-    pub async fn start(&mut self) {
+    pub async fn start(&mut self, info_hash: &'static [u8]) {
         loop {
-            let new_peers = self.peer_reciever.recv().await.unwrap();
-            for peer in new_peers {
-                if self.peers.insert(peer.clone()) {
-                    // Cloning peer here is not ideal
-                    self.introduce_peer(peer);
-                }
-            }
+            let new_peer = self.peer_reciever.recv().await.unwrap();
+            self.introduce_peer(new_peer, info_hash);
         }
     }
 
-    fn introduce_peer(&self, peer: Peer) {
+    pub async fn listen_for_peers(
+        sender: mpsc::Sender<PendingPeer>,
+        port: u16,
+    ) -> Result<()> {
+        let listener = TcpListener::bind(format!("0.0.0.0:{}", port)).await?;
+
+        loop {
+            let (stream, addr) = listener.accept().await?;
+            let peer = Peer::from_socket_address(addr);
+
+            sender
+                .send(PendingPeer::Incoming(peer, stream))
+                .await
+                .unwrap();
+        }
+    }
+
+    fn introduce_peer(&self, peer: PendingPeer, info_hash: &'static [u8]) {
         let reciever = self.channel.1.clone();
-        tokio::spawn(async move {});
+        let id = self.my_id.clone();
+        tokio::spawn(async move {
+            let mut peer_connection = PeerConnection::new(peer, id, info_hash).await.unwrap();
+        });
     }
 }
