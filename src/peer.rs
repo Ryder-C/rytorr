@@ -3,6 +3,7 @@ mod message;
 use std::{hash::Hash, net::SocketAddr};
 
 use anyhow::{ensure, Context, Result};
+use bendy::decoding::{FromBencode, ResultExt as _};
 use bit_vec::BitVec;
 use tokio::{
     io::{AsyncReadExt, AsyncWriteExt},
@@ -52,6 +53,46 @@ impl Hash for Peer {
     fn hash<H: std::hash::Hasher>(&self, state: &mut H) {
         self.ip.hash(state);
         self.port.hash(state);
+    }
+}
+
+impl FromBencode for Peer {
+    fn decode_bencode_object(
+        object: bendy::decoding::Object,
+    ) -> Result<Self, bendy::decoding::Error>
+    where
+        Self: Sized,
+    {
+        let mut peer_id = None;
+        let mut ip = None;
+        let mut port = None;
+
+        let mut dict = object.try_into_dictionary()?;
+
+        while let Some(pair) = dict.next_pair()? {
+            match pair {
+                (b"peer id", value) => {
+                    peer_id = String::decode_bencode_object(value)
+                        .context("peer id")
+                        .map(Some)?
+                }
+                (b"ip", value) => {
+                    ip = String::decode_bencode_object(value)
+                        .context("ip")
+                        .map(Some)?
+                }
+                (b"port", value) => {
+                    port = u16::decode_bencode_object(value)
+                        .context("port")
+                        .map(Some)?
+                }
+                _ => {}
+            }
+        }
+        let ip = ip.ok_or_else(|| bendy::decoding::Error::missing_field("ip"))?;
+        let port = port.ok_or_else(|| bendy::decoding::Error::missing_field("port"))?;
+
+        Ok(Self { peer_id, ip, port })
     }
 }
 
