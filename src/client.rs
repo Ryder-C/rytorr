@@ -6,9 +6,9 @@ use tokio::{
         Mutex, RwLock,
     },
 };
+use torrex::bencode::Torrent;
 
 use crate::{
-    bencode::Torrent,
     peer::Peer,
     swarm::Swarm,
     tracker::{http, udp, Trackable, TrackerType},
@@ -16,6 +16,7 @@ use crate::{
 use anyhow::{bail, Result};
 use rand::{distributions, Rng};
 
+#[derive(Debug)]
 pub enum PendingPeer {
     Outgoing(Peer),
     Incoming(Peer, TcpStream),
@@ -114,7 +115,6 @@ impl Client {
                     for peer in response.peers {
                         sender.send(PendingPeer::Outgoing(peer)).await.unwrap();
                     }
-                    // sender.send(response.peers).await.unwrap();
                     if let Some(new_seeders) = response.seeders {
                         *seeders.lock().await = new_seeders;
                     }
