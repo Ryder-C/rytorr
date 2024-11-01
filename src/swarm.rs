@@ -1,8 +1,13 @@
-use std::collections::HashSet;
+use std::{collections::HashSet, sync::Arc};
 
 use anyhow::Result;
 use async_channel::{self, Receiver, Sender};
-use tokio::{net::TcpListener, sync::mpsc};
+use tokio::{
+    net::TcpListener,
+    sync::{mpsc, OwnedSemaphorePermit, Semaphore},
+};
+
+const MAX_CONCURRENT_HANDSHAKES: usize = 10;
 
 use crate::{
     client::PendingPeer,
@@ -28,10 +33,30 @@ impl Swarm {
     }
 
     pub async fn start(&mut self, info_hash: &'static [u8]) {
+        let semaphore = Arc::new(Semaphore::new(MAX_CONCURRENT_HANDSHAKES));
         loop {
+            println!("Waiting for new peer...");
             let new_peer = self.peer_reciever.recv().await.unwrap();
+
+            // Check if peer is already connected
+            match &new_peer {
+                PendingPeer::Incoming(peer, _) => {
+                    if self.peers.contains(peer) {
+                        continue;
+                    }
+                }
+                PendingPeer::Outgoing(peer) => {
+                    if self.peers.contains(peer) {
+                        continue;
+                    }
+                }
+            }
             println!("Adding new peer: {:?}", new_peer);
-            self.introduce_peer(new_peer, info_hash);
+
+            // Limit the number of concurrent handshakes
+            let permit = semaphore.clone().acquire_owned().await.unwrap();
+
+            self.introduce_peer(new_peer, info_hash, permit).await;
         }
     }
 
@@ -50,11 +75,28 @@ impl Swarm {
         }
     }
 
-    fn introduce_peer(&self, peer: PendingPeer, info_hash: &'static [u8]) {
-        let receiver = self.channel.1.clone();
+    async fn introduce_peer(
+        &self,
+        peer: PendingPeer,
+        info_hash: &'static [u8],
+        _permit: OwnedSemaphorePermit,
+    ) {
         let id = self.my_id.clone();
         tokio::spawn(async move {
-            let mut peer_connection = PeerConnection::new(peer, id, info_hash).await.unwrap();
+            let mut peer_connection = match PeerConnection::new(peer, id, info_hash).await {
+                Ok(connection) => connection,
+                Err(e) => {
+                    println!("Failed to establish connection: {:?}", e);
+                    return;
+                }
+            };
+
+            println!(
+                "Connection established with peer: {:?}",
+                peer_connection.peer
+            );
+
+            peer_connection.start().await;
         });
     }
 }

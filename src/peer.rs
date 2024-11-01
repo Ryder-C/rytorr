@@ -97,7 +97,7 @@ impl FromBencode for Peer {
 }
 
 pub struct PeerConnection {
-    peer: Peer,
+    pub peer: Peer,
     my_id: String,
     stream: TcpStream,
     bitfield: Option<BitVec>,
@@ -110,6 +110,10 @@ pub struct PeerConnection {
 
 impl PeerConnection {
     const PSTR: &'static str = "BitTorrent protocol";
+
+    pub async fn start(&mut self) {
+        
+    }
 
     pub async fn new(peer: PendingPeer, my_id: String, info_hash: &'static [u8]) -> Result<Self> {
         Ok(match peer {
@@ -196,6 +200,12 @@ impl PeerConnection {
             "Peer did not send correct info hash"
         );
 
+        Ok(())
+    }
+
+    async fn send_message(&mut self, message: message::Message) -> Result<()> {
+        let bytes = message.to_be_bytes();
+        self.stream.write_all(&bytes).await?;
         Ok(())
     }
 }

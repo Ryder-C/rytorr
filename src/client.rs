@@ -40,7 +40,7 @@ impl Client {
         let size = torrent.info.files.iter().map(|f| f.length).sum();
 
         // Peer communication channel buffer size of number of trackers
-        let (peer_sender, peer_reciever) = mpsc::channel(torrent.announce_list.len());
+        let (peer_sender, peer_reciever) = mpsc::channel(50);
         Self::start_swarm(
             peer_sender.clone(),
             peer_reciever,
@@ -113,7 +113,9 @@ impl Client {
 
                     // Update seeders, leechers, and peers
                     for peer in response.peers {
+                        println!("Sending peer: {:?}", peer);
                         sender.send(PendingPeer::Outgoing(peer)).await.unwrap();
+                        println!("Sent peer");
                     }
                     if let Some(new_seeders) = response.seeders {
                         *seeders.lock().await = new_seeders;
@@ -122,7 +124,7 @@ impl Client {
                         *leechers.lock().await = new_leechers;
                     }
 
-                    thread::sleep(Duration::from_secs(response.interval as u64));
+                    tokio::time::sleep(Duration::from_secs(response.interval as u64)).await;
                 }
             });
         }

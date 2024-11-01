@@ -7,7 +7,7 @@ edition = "2021"
 anyhow = { version = "1.0.86", features = ["backtrace"] }
 async-channel = "2.3.1"
 bendy = { version = "0.3.3", features = ["serde"] }
-bit-vec = "0.7.0"
+bit-vec = "0.8.0"
 chrono = "0.4.38"
 hex = "0.4.3"
 once_cell = "1.19.0"
