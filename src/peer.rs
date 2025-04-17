@@ -112,7 +112,67 @@ impl PeerConnection {
     const PSTR: &'static str = "BitTorrent protocol";
 
     pub async fn start(&mut self) {
-        
+        // After handshake, express interest to receive bitfield
+        self.send_message(message::Message::Interested).await.expect("Failed to send Interested");
+        let mut len_buf = [0u8; 4];
+        loop {
+            // Read message length prefix
+            if let Err(_) = self.stream.read_exact(&mut len_buf).await {
+                break;
+            }
+            let len = u32::from_be_bytes(len_buf);
+            if len == 0 {
+                // keep-alive, no payload
+                continue;
+            }
+            // Read the rest of the message
+            let mut msg_buf = vec![0u8; len as usize];
+            if let Err(_) = self.stream.read_exact(&mut msg_buf).await {
+                break;
+            }
+            // Parse and handle message
+            if let Ok(msg) = message::Message::from_be_bytes(&msg_buf) {
+                match msg {
+                    message::Message::Bitfield(bitfield) => {
+                        println!("Received bitfield from {}: {} bits", self.peer.ip, bitfield.len());
+                        self.bitfield = Some(bitfield.clone());
+                        // Trigger requesting after initial bitfield
+                        self.request_rarest_piece().await;
+                    }
+                    message::Message::Have(index) => {
+                        println!("Peer {} has new piece {}", self.peer.ip, index);
+                        if let Some(ref mut bf) = self.bitfield {
+                            bf.set(index as usize, true);
+                        }
+                    }
+                    message::Message::Unchoke => {
+                        println!("Peer {} unchoked us", self.peer.ip);
+                        // Can request more blocks now
+                        self.request_rarest_piece().await;
+                    }
+                    _ => {
+                        // For now ignore other message types
+                    }
+                }
+            }
+        }
+    }
+
+    // Stub: selects a piece from the stored bitfield and sends a request
+    async fn request_rarest_piece(&mut self) {
+        // TODO: tally availability across all peers, sort by rarity, and request blocks for the rarest one.
+        if let Some(ref bf) = self.bitfield {
+            // For now, simply pick the first available piece
+            if let Some(idx) = bf.iter().position(|b| b) {
+                let block_size = 16 * 1024;
+                let begin = 0;
+                let length = block_size as u32;
+                println!("Requesting piece {} ({} bytes) from {}", idx, length, self.peer.ip);
+                let _ = self
+                    .send_message(message::Message::Request(idx as u32, begin, length))
+                    .await;
+            }
+        }
     }
 
     pub async fn new(peer: PendingPeer, my_id: String, info_hash: &'static [u8]) -> Result<Self> {
@@ -207,5 +267,45 @@ impl PeerConnection {
         let bytes = message.to_be_bytes();
         self.stream.write_all(&bytes).await?;
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::net::{IpAddr, Ipv4Addr};
+    
+    #[test]
+    fn test_from_be_bytes_ok() {
+        let raw = [192, 168, 0, 1, 0x1F, 0x90]; // 192.168.0.1:8080
+        let peer = Peer::from_be_bytes(&raw).unwrap();
+        assert_eq!(peer.ip, "192.168.0.1");
+        assert_eq!(peer.port, 8080);
+        assert!(peer.peer_id.is_none());
+    }
+
+    #[test]
+    fn test_from_be_bytes_err() {
+        let raw = [1, 2, 3];
+        assert!(Peer::from_be_bytes(&raw).is_err());
+    }
+
+    #[test]
+    fn test_from_socket_address() {
+        let addr = SocketAddr::new(IpAddr::V4(Ipv4Addr::new(10,0,0,1)), 6881);
+        let peer = Peer::from_socket_address(addr);
+        assert_eq!(peer.ip, "10.0.0.1");
+        assert_eq!(peer.port, 6881);
+    }
+
+    #[test]
+    fn test_eq_and_hash() {
+        use std::collections::HashSet;
+        let p1 = Peer { peer_id: None, ip: "1.1.1.1".into(), port: 1234 };
+        let p2 = Peer { peer_id: Some("id".into()), ip: "1.1.1.1".into(), port: 1234 };
+        assert_eq!(p1, p2);
+        let mut set = HashSet::new();
+        set.insert(p1);
+        assert!(set.contains(&p2));
     }
 }
