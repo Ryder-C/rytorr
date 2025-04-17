@@ -116,3 +116,62 @@ impl TryFrom<HttpResponse> for TrackerResponse {
         })
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::peer::Peer;
+
+    #[test]
+    fn test_event_display() {
+        assert_eq!(Event::Started.to_string(), "Started");
+        assert_eq!(Event::Stopped.to_string(), "Stopped");
+        assert_eq!(Event::Completed.to_string(), "Completed");
+    }
+
+    #[test]
+    fn test_type_from_url() {
+        assert!(matches!(TrackerType::type_from_url("http://example.com"), Ok(TrackerType::Http)));
+        assert!(matches!(TrackerType::type_from_url("udp://tracker:8080"), Ok(TrackerType::Udp)));
+        assert!(TrackerType::type_from_url("ftp://example.com").is_err());
+    }
+
+    #[test]
+    fn test_from_udp_response_valid() {
+        // construct valid response: action=1, transaction=42, interval=30, leechers=5, seeders=10, one peer 127.0.0.1:6881
+        let mut buf = Vec::new();
+        buf.extend(&1u32.to_be_bytes()); // action
+        buf.extend(&42u32.to_be_bytes()); // transaction
+        buf.extend(&30u32.to_be_bytes()); // interval
+        buf.extend(&5u32.to_be_bytes()); // leechers
+        buf.extend(&10u32.to_be_bytes()); // seeders
+        buf.extend(&[127,0,0,1,0x1A,0xE1]); // peer
+        let resp = TrackerResponse::from_udp_response(&buf, 42).unwrap();
+        assert_eq!(resp.interval, 30);
+        assert_eq!(resp.leechers, Some(5));
+        assert_eq!(resp.seeders, Some(10));
+        assert_eq!(resp.peers.len(), 1);
+        assert_eq!(resp.peers[0].ip, "127.0.0.1");
+        assert_eq!(resp.peers[0].port, 6881);
+    }
+
+    #[test]
+    fn test_from_udp_response_errors() {
+        // wrong transaction id
+        let mut buf = Vec::new();
+        buf.extend(&1u32.to_be_bytes());
+        buf.extend(&1u32.to_be_bytes());
+        buf.extend(&0u32.to_be_bytes());
+        buf.extend(&0u32.to_be_bytes());
+        buf.extend(&0u32.to_be_bytes());
+        assert!(TrackerResponse::from_udp_response(&buf, 2).is_err());
+        // wrong action
+        let mut buf2 = Vec::new();
+        buf2.extend(&2u32.to_be_bytes());
+        buf2.extend(&0u32.to_be_bytes());
+        buf2.extend(&0u32.to_be_bytes());
+        buf2.extend(&0u32.to_be_bytes());
+        buf2.extend(&0u32.to_be_bytes());
+        assert!(TrackerResponse::from_udp_response(&buf2, 0).is_err());
+    }
+}

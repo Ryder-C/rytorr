@@ -172,3 +172,42 @@ impl FromBencode for File {
         })
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use bendy::decoding::FromBencode;
+
+    #[test]
+    fn test_info_single_file() {
+        let bencode = b"d4:name4:test6:lengthi12345ee";
+        let info = Info::from_bencode(&bencode[..]).unwrap();
+        assert_eq!(info.name, "test");
+        assert_eq!(info.files.len(), 1);
+        assert_eq!(info.files[0].length, 12345);
+    }
+
+    #[test]
+    fn test_torrent_single_announce() {
+        // bencoded torrent with announce and single-file info
+        let bencode = b"d8:announce4:http4:infod4:name4:test6:lengthi42eee";
+        let torrent = Torrent::from_bencode(&bencode[..]).unwrap();
+        assert_eq!(torrent.announce_list, vec!["http".to_string()]);
+        assert_eq!(torrent.info.name, "test");
+        assert_eq!(torrent.info.files.len(), 1);
+        assert_eq!(torrent.info.files[0].length, 42);
+    }
+
+    #[test]
+    fn test_info_multi_file() {
+        // multi-file info with two files
+        let bencode = b"d4:name4:root5:filesld6:lengthi11e4:pathl5:file1.eed6:lengthi22e4:pathl5:file2.eeee";
+        let info = Info::from_bencode(&bencode[..]).unwrap();
+        assert_eq!(info.name, "root");
+        assert_eq!(info.files.len(), 2);
+        assert_eq!(info.files[0].length, 11);
+        assert_eq!(info.files[0].path, PathBuf::from("file1.e"));
+        assert_eq!(info.files[1].length, 22);
+        assert_eq!(info.files[1].path, PathBuf::from("file2.e"));
+    }
+}

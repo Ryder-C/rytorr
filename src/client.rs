@@ -148,3 +148,24 @@ impl Client {
         })
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    
+    #[test]
+    fn test_generate_peer_id_format() {
+        let id = Client::generate_peer_id();
+        // should start with prefix and be 20 chars
+        assert!(id.starts_with("-RY0000-"));
+        assert_eq!(id.len(), 20);
+    }
+
+    #[test]
+    fn test_create_tracker_invalid() {
+        let result = Client::create_tracker("ftp://example.com".to_string(), b"hashhashhashhashhash" as &[u8], "peerid".to_string(), 6881, 100);
+        assert!(result.is_err());
+        let err = result.err().unwrap();
+        assert!(err.to_string().contains("Unknown tracker protocol"));
+    }
+}
