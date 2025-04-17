@@ -213,7 +213,8 @@ mod tests {
     #[test]
     fn test_http_response_list_peers() {
         // keys sorted: complete, incomplete, interval, peers; inner peer dict sorted: ip, port
-        let bencoded = b"d8:completei2e10:incompletei3e8:intervali60e5:peersld2:ip9:127.0.0.14:porti6881eeee";
+        let bencoded =
+            b"d8:completei2e10:incompletei3e8:intervali60e5:peersld2:ip9:127.0.0.14:porti6881eeee";
         let resp = HttpResponse::from_bencode(&bencoded[..]).unwrap();
         assert_eq!(resp.interval.unwrap(), 60);
         assert_eq!(resp.seeders.unwrap(), 2);
@@ -225,7 +226,7 @@ mod tests {
 
     #[test]
     fn test_http_response_compact_peers() {
-        let peers_bytes = [127,0,0,1,0x1A,0xE1];
+        let peers_bytes = [127, 0, 0, 1, 0x1A, 0xE1];
         // keys sorted: complete, incomplete, interval, peers; peers value is bytes with length prefix
         let mut bencoded = b"d8:completei1e10:incompletei1e8:intervali30e5:peers6:".to_vec();
         bencoded.extend(&peers_bytes);

@@ -113,7 +113,9 @@ impl PeerConnection {
 
     pub async fn start(&mut self) {
         // After handshake, express interest to receive bitfield
-        self.send_message(message::Message::Interested).await.expect("Failed to send Interested");
+        self.send_message(message::Message::Interested)
+            .await
+            .expect("Failed to send Interested");
         let mut len_buf = [0u8; 4];
         loop {
             // Read message length prefix
@@ -134,7 +136,11 @@ impl PeerConnection {
             if let Ok(msg) = message::Message::from_be_bytes(&msg_buf) {
                 match msg {
                     message::Message::Bitfield(bitfield) => {
-                        println!("Received bitfield from {}: {} bits", self.peer.ip, bitfield.len());
+                        println!(
+                            "Received bitfield from {}: {} bits",
+                            self.peer.ip,
+                            bitfield.len()
+                        );
                         self.bitfield = Some(bitfield.clone());
                         // Trigger requesting after initial bitfield
                         self.request_rarest_piece().await;
@@ -167,7 +173,10 @@ impl PeerConnection {
                 let block_size = 16 * 1024;
                 let begin = 0;
                 let length = block_size as u32;
-                println!("Requesting piece {} ({} bytes) from {}", idx, length, self.peer.ip);
+                println!(
+                    "Requesting piece {} ({} bytes) from {}",
+                    idx, length, self.peer.ip
+                );
                 let _ = self
                     .send_message(message::Message::Request(idx as u32, begin, length))
                     .await;
@@ -274,7 +283,7 @@ impl PeerConnection {
 mod tests {
     use super::*;
     use std::net::{IpAddr, Ipv4Addr};
-    
+
     #[test]
     fn test_from_be_bytes_ok() {
         let raw = [192, 168, 0, 1, 0x1F, 0x90]; // 192.168.0.1:8080
@@ -292,7 +301,7 @@ mod tests {
 
     #[test]
     fn test_from_socket_address() {
-        let addr = SocketAddr::new(IpAddr::V4(Ipv4Addr::new(10,0,0,1)), 6881);
+        let addr = SocketAddr::new(IpAddr::V4(Ipv4Addr::new(10, 0, 0, 1)), 6881);
         let peer = Peer::from_socket_address(addr);
         assert_eq!(peer.ip, "10.0.0.1");
         assert_eq!(peer.port, 6881);
@@ -301,8 +310,16 @@ mod tests {
     #[test]
     fn test_eq_and_hash() {
         use std::collections::HashSet;
-        let p1 = Peer { peer_id: None, ip: "1.1.1.1".into(), port: 1234 };
-        let p2 = Peer { peer_id: Some("id".into()), ip: "1.1.1.1".into(), port: 1234 };
+        let p1 = Peer {
+            peer_id: None,
+            ip: "1.1.1.1".into(),
+            port: 1234,
+        };
+        let p2 = Peer {
+            peer_id: Some("id".into()),
+            ip: "1.1.1.1".into(),
+            port: 1234,
+        };
         assert_eq!(p1, p2);
         let mut set = HashSet::new();
         set.insert(p1);

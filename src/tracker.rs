@@ -131,8 +131,14 @@ mod tests {
 
     #[test]
     fn test_type_from_url() {
-        assert!(matches!(TrackerType::type_from_url("http://example.com"), Ok(TrackerType::Http)));
-        assert!(matches!(TrackerType::type_from_url("udp://tracker:8080"), Ok(TrackerType::Udp)));
+        assert!(matches!(
+            TrackerType::type_from_url("http://example.com"),
+            Ok(TrackerType::Http)
+        ));
+        assert!(matches!(
+            TrackerType::type_from_url("udp://tracker:8080"),
+            Ok(TrackerType::Udp)
+        ));
         assert!(TrackerType::type_from_url("ftp://example.com").is_err());
     }
 
@@ -145,7 +151,7 @@ mod tests {
         buf.extend(&30u32.to_be_bytes()); // interval
         buf.extend(&5u32.to_be_bytes()); // leechers
         buf.extend(&10u32.to_be_bytes()); // seeders
-        buf.extend(&[127,0,0,1,0x1A,0xE1]); // peer
+        buf.extend(&[127, 0, 0, 1, 0x1A, 0xE1]); // peer
         let resp = TrackerResponse::from_udp_response(&buf, 42).unwrap();
         assert_eq!(resp.interval, 30);
         assert_eq!(resp.leechers, Some(5));

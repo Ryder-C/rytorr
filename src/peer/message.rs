@@ -1,5 +1,5 @@
+use anyhow::{bail, Result};
 use bit_vec::BitVec;
-use anyhow::{Result, bail};
 
 const PSTR: &str = "BitTorrent protocol";
 
@@ -35,9 +35,7 @@ impl Message {
             Message::Unchoke => Self::encode_msg(1, &[]),
             Message::Interested => Self::encode_msg(2, &[]),
             Message::NotInterested => Self::encode_msg(3, &[]),
-            Message::Have(piece_index) => {
-                Self::encode_msg(4, &piece_index.to_be_bytes())
-            }
+            Message::Have(piece_index) => Self::encode_msg(4, &piece_index.to_be_bytes()),
             Message::Bitfield(bitfield) => {
                 let bit_bytes = bitfield.to_bytes();
                 Self::encode_msg(5, &bit_bytes)
@@ -63,9 +61,7 @@ impl Message {
                 payload.extend_from_slice(&length.to_be_bytes());
                 Self::encode_msg(8, &payload)
             }
-            Message::Port(port) => {
-                Self::encode_msg(9, &port.to_be_bytes())
-            }
+            Message::Port(port) => Self::encode_msg(9, &port.to_be_bytes()),
         }
     }
 
@@ -125,7 +121,7 @@ mod tests {
     #[test]
     fn test_keepalive() {
         let ba = Message::KeepAlive.to_be_bytes();
-        assert_eq!(ba, vec![0,0,0,0]);
+        assert_eq!(ba, vec![0, 0, 0, 0]);
         let msg = Message::from_be_bytes(&[]).unwrap();
         assert!(matches!(msg, Message::KeepAlive));
     }
@@ -143,9 +139,13 @@ mod tests {
         let idx = 123;
         let ba = Message::Have(idx).to_be_bytes();
         // length(5), id(4), piece index
-        assert_eq!(&ba[0..5], &[0,0,0,5,4]);
+        assert_eq!(&ba[0..5], &[0, 0, 0, 5, 4]);
         let parsed = Message::from_be_bytes(&ba[4..]).unwrap();
-        if let Message::Have(i) = parsed { assert_eq!(i, idx); } else { panic!() }
+        if let Message::Have(i) = parsed {
+            assert_eq!(i, idx);
+        } else {
+            panic!()
+        }
     }
 
     #[test]
@@ -154,38 +154,52 @@ mod tests {
         let bv = BitVec::from_bytes(&data);
         let ba = Message::Bitfield(bv.clone()).to_be_bytes();
         // len = 1 + bytes
-        let len = ((ba[0] as u32) << 24) | ((ba[1] as u32) << 16) | ((ba[2] as u32) << 8) | (ba[3] as u32);
+        let len = ((ba[0] as u32) << 24)
+            | ((ba[1] as u32) << 16)
+            | ((ba[2] as u32) << 8)
+            | (ba[3] as u32);
         assert_eq!(len as usize, 1 + data.len());
         assert_eq!(ba[4], 5);
         let parsed = Message::from_be_bytes(&ba[4..]).unwrap();
-        if let Message::Bitfield(pb) = parsed { assert_eq!(pb.to_bytes(), data); } else { panic!() }
+        if let Message::Bitfield(pb) = parsed {
+            assert_eq!(pb.to_bytes(), data);
+        } else {
+            panic!()
+        }
     }
 
     #[test]
     fn test_request() {
-        let m = Message::Request(1,2,3);
+        let m = Message::Request(1, 2, 3);
         let ba = m.to_be_bytes();
-        let len = ((ba[0] as u32) << 24) | ((ba[1] as u32) << 16) | ((ba[2] as u32) << 8) | (ba[3] as u32);
+        let len = ((ba[0] as u32) << 24)
+            | ((ba[1] as u32) << 16)
+            | ((ba[2] as u32) << 8)
+            | (ba[3] as u32);
         assert_eq!(len, 13);
         assert_eq!(ba[4], 6);
         let parsed = Message::from_be_bytes(&ba[4..]).unwrap();
-        if let Message::Request(a,b,c) = parsed { assert_eq!((a,b,c),(1,2,3)); } else { panic!() }
+        if let Message::Request(a, b, c) = parsed {
+            assert_eq!((a, b, c), (1, 2, 3));
+        } else {
+            panic!()
+        }
     }
 
     #[test]
     fn test_piece_cancel_port() {
         // piece
-        let block = vec![9,8,7];
-        let m = Message::Piece(10,20,block.clone());
+        let block = vec![9, 8, 7];
+        let m = Message::Piece(10, 20, block.clone());
         let ba = m.to_be_bytes();
-        assert_eq!(ba[4],7);
+        assert_eq!(ba[4], 7);
         // cancel
-        let m2 = Message::Cancel(5,6,7);
+        let m2 = Message::Cancel(5, 6, 7);
         let ba2 = m2.to_be_bytes();
-        assert_eq!(ba2[4],8);
+        assert_eq!(ba2[4], 8);
         // port
         let m3 = Message::Port(6881);
         let ba3 = m3.to_be_bytes();
-        assert_eq!(ba3[4],9);
+        assert_eq!(ba3[4], 9);
     }
 }
