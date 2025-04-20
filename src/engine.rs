@@ -22,7 +22,7 @@ pub enum PendingPeer {
     Incoming(Peer, TcpStream),
 }
 
-pub struct Client {
+pub struct Engine {
     torrent: &'static Torrent,
     peer_sender: Sender<PendingPeer>,
     peer_id: String,
@@ -34,7 +34,7 @@ pub struct Client {
     size: u64,
 }
 
-impl Client {
+impl Engine {
     pub fn new(torrent: &'static Torrent, port: u16) -> Self {
         let peer_id = Self::generate_peer_id();
         let size = torrent.info.files.iter().map(|f| f.length).sum();
@@ -176,7 +176,7 @@ mod tests {
 
     #[test]
     fn test_generate_peer_id_format() {
-        let id = Client::generate_peer_id();
+        let id = Engine::generate_peer_id();
         // should start with prefix and be 20 chars
         assert!(id.starts_with("-RY0000-"));
         assert_eq!(id.len(), 20);
@@ -184,7 +184,7 @@ mod tests {
 
     #[test]
     fn test_create_tracker_invalid() {
-        let result = Client::create_tracker(
+        let result = Engine::create_tracker(
             "ftp://example.com".to_string(),
             b"hashhashhashhashhash" as &[u8],
             "peerid".to_string(),

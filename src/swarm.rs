@@ -17,7 +17,7 @@ use tokio::{
 const MAX_CONCURRENT_HANDSHAKES: usize = 10;
 
 use crate::{
-    client::PendingPeer,
+    engine::PendingPeer, // Changed from client::PendingPeer
     file::Piece,
     peer::{Peer, PeerConnection},
 };
@@ -124,11 +124,12 @@ async fn scheduler_loop(
         }
 
         let states = peer_states.lock().await;
+        let have = global_have.lock().await;
+
         if states.is_empty() {
             // No peers, nothing to do
             continue;
         }
-        let have = global_have.lock().await;
 
         let rarity = calculate_rarity(&states, num_pieces);
 
@@ -155,7 +156,7 @@ async fn scheduler_loop(
                 }
             }
         }
-    } // states and have go out of scope here in the normal path, dropping automatically
+    }
 }
 
 // Async task to handle peer events and update state
@@ -216,7 +217,7 @@ async fn event_loop(
         if state_changed {
             notify.notify_one();
         }
-    } // states goes out of scope here, dropping automatically
+    }
 }
 
 impl Swarm {
@@ -318,9 +319,6 @@ impl Swarm {
             };
             if self.peers.contains(&peer_obj) {
                 println!("Peer already connected: {:?}", peer_obj);
-                if let PendingPeer::Incoming(_, stream) = new_peer {
-                    drop(stream);
-                }
                 continue;
             }
             println!("Adding new peer: {:?}", new_peer);

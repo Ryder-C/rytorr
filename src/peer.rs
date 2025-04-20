@@ -3,7 +3,7 @@ mod message;
 use std::collections::HashMap;
 use std::{hash::Hash, net::SocketAddr};
 
-use crate::client::PendingPeer;
+use crate::engine::PendingPeer;
 use crate::file::Piece;
 use anyhow::{ensure, Context, Result};
 use async_channel::Sender;
