@@ -1,10 +1,10 @@
-mod client;
+mod engine;
 mod file;
 mod peer;
 mod swarm;
 mod tracker;
 
-use client::Client;
+use engine::Engine;
 use once_cell::sync::Lazy;
 use torrex::bencode::Torrent;
 
@@ -16,7 +16,7 @@ async fn main() {
     println!("Starting {:?}", TORRENT.info.name);
 
     // Build torrent client (starts p2p swarm)
-    let client = Client::new(&TORRENT, 4444);
+    let client = Engine::new(&TORRENT, 4444);
     client.start_tracking();
 
     // Keep main thread alive (temporary)
