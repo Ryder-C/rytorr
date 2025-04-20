@@ -17,7 +17,7 @@ use tokio::{
 const MAX_CONCURRENT_HANDSHAKES: usize = 10;
 
 use crate::{
-    engine::PendingPeer, // Changed from client::PendingPeer
+    engine::PendingPeer,
     file::Piece,
     peer::{Peer, PeerConnection},
 };
@@ -43,7 +43,7 @@ pub struct Swarm {
     torrent_name: String,
     size: u64,
     piece_length: u64,
-    pieces: Vec<[u8; 20]>,
+    pieces: Arc<Vec<[u8; 20]>>,
     downloaded: Arc<RwLock<u64>>,
     uploaded: Arc<RwLock<u64>>,
     peer_cmd_senders: HashMap<Peer, UnboundedSender<SwarmCommand>>,
@@ -227,7 +227,7 @@ impl Swarm {
         torrent_name: String,
         size: u64,
         piece_length: u64,
-        pieces: Vec<[u8; 20]>,
+        pieces: Arc<Vec<[u8; 20]>>,
         downloaded: Arc<RwLock<u64>>,
         uploaded: Arc<RwLock<u64>>,
     ) -> Self {
@@ -246,7 +246,7 @@ impl Swarm {
         }
     }
 
-    pub async fn start(&mut self, info_hash: &'static [u8]) {
+    pub async fn start(&mut self, info_hash: Arc<Vec<u8>>) {
         let torrent_name = self.torrent_name.clone();
         let piece_length = self.piece_length;
         let num_pieces = self.pieces.len();
@@ -330,7 +330,7 @@ impl Swarm {
 
             self.introduce_peer(
                 new_peer,
-                info_hash,
+                info_hash.clone(),
                 permit,
                 piece_sender,
                 self.piece_length as usize,
@@ -362,11 +362,11 @@ impl Swarm {
     async fn introduce_peer(
         &self,
         peer: PendingPeer,
-        info_hash: &'static [u8],
+        info_hash: Arc<Vec<u8>>,
         _permit: OwnedSemaphorePermit,
         piece_sender: Sender<Piece>,
         piece_length: usize,
-        piece_hashes: Vec<[u8; 20]>,
+        piece_hashes: Arc<Vec<[u8; 20]>>,
         peer_event_tx: UnboundedSender<PeerEvent>,
         cmd_rx: UnboundedReceiver<SwarmCommand>,
     ) {

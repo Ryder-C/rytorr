@@ -23,7 +23,7 @@ pub enum PendingPeer {
 }
 
 pub struct Engine {
-    torrent: &'static Torrent,
+    torrent: Arc<Torrent>,
     peer_sender: Sender<PendingPeer>,
     peer_id: String,
     port: u16,
@@ -35,24 +35,30 @@ pub struct Engine {
 }
 
 impl Engine {
-    pub fn new(torrent: &'static Torrent, port: u16) -> Self {
+    pub fn new(torrent: Torrent, port: u16) -> Self {
+        let torrent = Arc::new(torrent);
         let peer_id = Self::generate_peer_id();
         let size = torrent.info.files.iter().map(|f| f.length).sum();
 
-        // Peer communication channel buffer size of number of trackers
         let (peer_sender, peer_reciever) = mpsc::channel(50);
+
+        let info_hash = Arc::new(torrent.info.hash.to_vec());
+        let pieces = Arc::new(torrent.info.pieces.clone());
+        let downloaded = Arc::new(RwLock::new(0));
+        let uploaded = Arc::new(RwLock::new(0));
+
         Self::start_swarm(
             peer_sender.clone(),
             peer_reciever,
             peer_id.clone(),
             port,
-            &torrent.info.hash,
+            info_hash,
             torrent.info.name.clone(),
             size,
             torrent.info.piece_length as u64,
-            torrent.info.pieces.clone(),
-            Arc::new(RwLock::new(0)),
-            Arc::new(RwLock::new(0)),
+            pieces,
+            downloaded.clone(),
+            uploaded.clone(),
         );
 
         Self {
@@ -60,8 +66,8 @@ impl Engine {
             peer_sender,
             peer_id,
             port,
-            downloaded: Arc::new(RwLock::new(0)),
-            uploaded: Arc::new(RwLock::new(0)),
+            downloaded,
+            uploaded,
             seeders: Arc::new(Mutex::new(0)),
             leechers: Arc::new(Mutex::new(0)),
             size,
@@ -82,11 +88,11 @@ impl Engine {
         reciever: Receiver<PendingPeer>,
         peer_id: String,
         port: u16,
-        info_hash: &'static [u8],
+        info_hash: Arc<Vec<u8>>,
         torrent_name: String,
         size: u64,
         piece_length: u64,
-        pieces: Vec<[u8; 20]>,
+        pieces: Arc<Vec<[u8; 20]>>,
         downloaded: Arc<RwLock<u64>>,
         uploaded: Arc<RwLock<u64>>,
     ) {
@@ -97,20 +103,20 @@ impl Engine {
                 torrent_name,
                 size,
                 piece_length,
-                pieces,
+                pieces.clone(),
                 downloaded.clone(),
                 uploaded.clone(),
             );
 
             tokio::spawn(Swarm::listen_for_peers(sender.clone(), port));
 
-            swarm.start(info_hash).await; // Loops indefinitely
+            swarm.start(info_hash).await;
         });
     }
 
     pub fn start_tracking(&self) {
         let announce_list = self.torrent.announce_list.clone();
-        let info_hash = &self.torrent.info.hash;
+        let info_hash = Arc::new(self.torrent.info.hash.to_vec());
         let port = self.port;
         let size = self.size;
 
@@ -121,22 +127,36 @@ impl Engine {
             let seeders = self.seeders.clone();
             let leechers = self.leechers.clone();
             let sender = self.peer_sender.clone();
+            let url_clone = url.clone();
+            let info_hash_clone = info_hash.clone();
 
             tokio::spawn(async move {
-                let mut tracker =
-                    Self::create_tracker(url, info_hash, peer_id, port, size).unwrap();
+                let mut tracker = match Self::create_tracker(url_clone, info_hash_clone, peer_id, port, size) {
+                    Ok(t) => t,
+                    Err(e) => {
+                        eprintln!("Failed to create tracker for {}: {}", url, e);
+                        return;
+                    }
+                };
 
                 loop {
                     tracker.update_progress(*downloaded.read().await, *uploaded.read().await);
-                    let response = tracker.scrape().unwrap();
+                    let response = match tracker.scrape() {
+                        Ok(r) => r,
+                        Err(e) => {
+                            eprintln!("Tracker scrape error for {}: {}", url, e);
+                            tokio::time::sleep(Duration::from_secs(60)).await;
+                            continue;
+                        }
+                    };
 
-                    println!("Recieved response: {:?}", response);
+                    println!("Received response from {}: {:?}", url, response);
 
-                    // Update seeders, leechers, and peers
                     for peer in response.peers {
-                        println!("Sending peer: {:?}", peer);
-                        sender.send(PendingPeer::Outgoing(peer)).await.unwrap();
-                        println!("Sent peer");
+                        if let Err(e) = sender.send(PendingPeer::Outgoing(peer)).await {
+                            eprintln!("Failed to send peer to swarm: {}", e);
+                            break;
+                        }
                     }
                     if let Some(new_seeders) = response.seeders {
                         *seeders.lock().await = new_seeders;
@@ -153,14 +173,14 @@ impl Engine {
 
     fn create_tracker(
         url: String,
-        info_hash: &'static [u8],
+        info_hash: Arc<Vec<u8>>,
         peer_id: String,
         port: u16,
         size: u64,
     ) -> Result<Box<dyn Trackable>> {
         let tracker_type = match TrackerType::type_from_url(&url) {
             Ok(typ) => typ,
-            Err(_) => bail!("Unknown tracker protocol"),
+            Err(_) => bail!("Unknown tracker protocol for URL: {}", url),
         };
 
         Ok(match tracker_type {
@@ -173,20 +193,21 @@ impl Engine {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::Arc;
 
     #[test]
     fn test_generate_peer_id_format() {
         let id = Engine::generate_peer_id();
-        // should start with prefix and be 20 chars
         assert!(id.starts_with("-RY0000-"));
         assert_eq!(id.len(), 20);
     }
 
     #[test]
     fn test_create_tracker_invalid() {
+        let dummy_hash = Arc::new(vec![0u8; 20]);
         let result = Engine::create_tracker(
             "ftp://example.com".to_string(),
-            b"hashhashhashhashhash" as &[u8],
+            dummy_hash,
             "peerid".to_string(),
             6881,
             100,

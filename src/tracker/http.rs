@@ -1,4 +1,5 @@
 use crate::{peer::Peer, tracker::MAX_PEERS};
+use std::sync::Arc;
 
 use super::{Trackable, TrackerResponse};
 use anyhow::{bail, Result};
@@ -6,29 +7,28 @@ use bendy::decoding::{FromBencode, Object, ResultExt as _};
 use urlencoding::encode_binary;
 
 // Tracker parameters from bittorrent spec <https://wiki.theory.org/BitTorrentSpecification#Tracker_HTTP.2FHTTPS_Protocol>
-pub struct Http<'a> {
+pub struct Http {
     url: String,
-    info_hash: String,
+    info_hash: Arc<Vec<u8>>,
     peer_id: String,
     port: u16,
     uploaded: u64,
     downloaded: u64,
     size: u64,
     // Compact always 1
-    event: Option<&'a str>,
+    event: Option<&'static str>,
     tracker_id: Option<String>,
 }
 
-impl Http<'_> {
+impl Http {
     pub fn new(
         url: String,
-        info_hash: &'static [u8],
+        info_hash: Arc<Vec<u8>>,
         peer_id: String,
         port: u16,
         size: u64,
     ) -> Self {
         let event = None; // Some(EVENT_STARTED);
-        let info_hash = encode_binary(info_hash).into_owned();
 
         Self {
             url,
@@ -44,10 +44,12 @@ impl Http<'_> {
     }
 }
 
-impl Trackable for Http<'_> {
+impl Trackable for Http {
     fn scrape(&mut self) -> Result<TrackerResponse> {
+        // URL-encode the info_hash bytes here
+        let info_hash_encoded = encode_binary(&self.info_hash).into_owned();
         // Have to do this to avoid info_hash being double url encoded. Cant find a way to pass in bytes or disable url encoding in ureq.
-        let request_url = format!("{}?info_hash={}", &self.url, &self.info_hash);
+        let request_url = format!("{}?info_hash={}", &self.url, &info_hash_encoded);
 
         let mut request = ureq::get(&request_url)
             .query("peer_id", &self.peer_id)

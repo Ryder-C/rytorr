@@ -1,7 +1,7 @@
 mod message;
 
 use std::collections::HashMap;
-use std::{hash::Hash, net::SocketAddr};
+use std::{hash::Hash, net::SocketAddr, sync::Arc};
 
 use crate::engine::PendingPeer;
 use crate::file::Piece;
@@ -93,7 +93,7 @@ pub struct PeerConnection {
     pub peer: Peer,
     pub piece_sender: Sender<Piece>,
     piece_length: usize,
-    piece_hashes: Vec<[u8; 20]>,
+    piece_hashes: Arc<Vec<[u8; 20]>>,
     pending_pieces: HashMap<usize, Vec<Option<Vec<u8>>>>,
     my_id: String,
     stream: TcpStream,
@@ -115,10 +115,10 @@ impl PeerConnection {
     pub async fn new(
         peer: PendingPeer,
         my_id: String,
-        info_hash: &'static [u8],
+        info_hash: Arc<Vec<u8>>,
         piece_sender: Sender<Piece>,
         piece_length: usize,
-        piece_hashes: Vec<[u8; 20]>,
+        piece_hashes: Arc<Vec<[u8; 20]>>,
         event_tx: UnboundedSender<PeerEvent>,
         cmd_rx: UnboundedReceiver<SwarmCommand>,
     ) -> Result<Self> {
@@ -158,18 +158,18 @@ impl PeerConnection {
     async fn new_outgoing(
         peer: Peer,
         my_id: String,
-        info_hash: &'static [u8],
+        info_hash: Arc<Vec<u8>>,
         piece_sender: Sender<Piece>,
         piece_length: usize,
-        piece_hashes: Vec<[u8; 20]>,
+        piece_hashes: Arc<Vec<[u8; 20]>>,
         event_tx: UnboundedSender<PeerEvent>,
         cmd_rx: UnboundedReceiver<SwarmCommand>,
     ) -> Result<Self> {
         let mut stream = TcpStream::connect(format!("{}:{}", peer.ip, peer.port))
             .await
             .context("Connect to TcpStream")?;
-        Self::write_handshake(&mut stream, info_hash, &my_id).await?;
-        Self::read_handshake(&mut stream, info_hash).await?;
+        Self::write_handshake(&mut stream, &info_hash, &my_id).await?;
+        Self::read_handshake(&mut stream, &info_hash).await?;
         let have = BitVec::from_elem(piece_hashes.len(), false);
         Ok(Self {
             peer,
@@ -194,15 +194,15 @@ impl PeerConnection {
         peer: Peer,
         mut stream: TcpStream,
         my_id: String,
-        info_hash: &'static [u8],
+        info_hash: Arc<Vec<u8>>,
         piece_sender: Sender<Piece>,
         piece_length: usize,
-        piece_hashes: Vec<[u8; 20]>,
+        piece_hashes: Arc<Vec<[u8; 20]>>,
         event_tx: UnboundedSender<PeerEvent>,
         cmd_rx: UnboundedReceiver<SwarmCommand>,
     ) -> Result<Self> {
-        Self::read_handshake(&mut stream, info_hash).await?;
-        Self::write_handshake(&mut stream, info_hash, &my_id).await?;
+        Self::read_handshake(&mut stream, &info_hash).await?;
+        Self::write_handshake(&mut stream, &info_hash, &my_id).await?;
         let have = BitVec::from_elem(piece_hashes.len(), false);
         Ok(Self {
             peer,
