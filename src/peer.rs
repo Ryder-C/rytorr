@@ -1,16 +1,21 @@
 mod message;
 
+use std::collections::HashMap;
 use std::{hash::Hash, net::SocketAddr};
 
+use crate::client::PendingPeer;
+use crate::file::Piece;
 use anyhow::{ensure, Context, Result};
-use bendy::decoding::{FromBencode, ResultExt as _};
+use async_channel::Sender;
+use bendy::decoding::FromBencode;
 use bit_vec::BitVec;
+use sha1::{Digest, Sha1};
 use tokio::{
     io::{AsyncReadExt, AsyncWriteExt},
     net::TcpStream,
+    sync::mpsc::{UnboundedSender, UnboundedReceiver},
 };
-
-use crate::client::PendingPeer;
+use crate::swarm::{PeerEvent, SwarmCommand};
 
 #[derive(Debug, Clone)]
 pub struct Peer {
@@ -71,21 +76,9 @@ impl FromBencode for Peer {
 
         while let Some(pair) = dict.next_pair()? {
             match pair {
-                (b"peer id", value) => {
-                    peer_id = String::decode_bencode_object(value)
-                        .context("peer id")
-                        .map(Some)?
-                }
-                (b"ip", value) => {
-                    ip = String::decode_bencode_object(value)
-                        .context("ip")
-                        .map(Some)?
-                }
-                (b"port", value) => {
-                    port = u16::decode_bencode_object(value)
-                        .context("port")
-                        .map(Some)?
-                }
+                (b"peer id", value) => peer_id = Some(String::decode_bencode_object(value)?),
+                (b"ip", value) => ip = Some(String::decode_bencode_object(value)?),
+                (b"port", value) => port = Some(u16::decode_bencode_object(value)?),
                 _ => {}
             }
         }
@@ -98,116 +91,102 @@ impl FromBencode for Peer {
 
 pub struct PeerConnection {
     pub peer: Peer,
+    pub piece_sender: Sender<Piece>,
+    piece_length: usize,
+    piece_hashes: Vec<[u8; 20]>,
+    pending_pieces: HashMap<usize, Vec<Option<Vec<u8>>>>,
     my_id: String,
     stream: TcpStream,
-    bitfield: Option<BitVec>,
+    pub peer_bitfield: Option<BitVec>,
+    pub have_bitfield: Option<BitVec>,
 
     am_choking: bool,
     am_interested: bool,
     peer_choking: bool,
     peer_interested: bool,
+
+    event_tx: UnboundedSender<PeerEvent>,
+    cmd_rx: UnboundedReceiver<SwarmCommand>,
 }
 
 impl PeerConnection {
     const PSTR: &'static str = "BitTorrent protocol";
 
-    pub async fn start(&mut self) {
-        // After handshake, express interest to receive bitfield
-        self.send_message(message::Message::Interested)
-            .await
-            .expect("Failed to send Interested");
-        let mut len_buf = [0u8; 4];
-        loop {
-            // Read message length prefix
-            if let Err(_) = self.stream.read_exact(&mut len_buf).await {
-                break;
+    pub async fn new(
+        peer: PendingPeer,
+        my_id: String,
+        info_hash: &'static [u8],
+        piece_sender: Sender<Piece>,
+        piece_length: usize,
+        piece_hashes: Vec<[u8; 20]>,
+        event_tx: UnboundedSender<PeerEvent>,
+        cmd_rx: UnboundedReceiver<SwarmCommand>,
+    ) -> Result<Self> {
+        let mut conn = match peer {
+            PendingPeer::Outgoing(p) => {
+                Self::new_outgoing(
+                    p,
+                    my_id,
+                    info_hash,
+                    piece_sender.clone(),
+                    piece_length,
+                    piece_hashes.clone(),
+                    event_tx.clone(),
+                    cmd_rx,
+                )
+                .await?
             }
-            let len = u32::from_be_bytes(len_buf);
-            if len == 0 {
-                // keep-alive, no payload
-                continue;
+            PendingPeer::Incoming(p, s) => {
+                Self::new_incoming(
+                    p,
+                    s,
+                    my_id,
+                    info_hash,
+                    piece_sender.clone(),
+                    piece_length,
+                    piece_hashes.clone(),
+                    event_tx.clone(),
+                    cmd_rx,
+                )
+                .await?
             }
-            // Read the rest of the message
-            let mut msg_buf = vec![0u8; len as usize];
-            if let Err(_) = self.stream.read_exact(&mut msg_buf).await {
-                break;
-            }
-            // Parse and handle message
-            if let Ok(msg) = message::Message::from_be_bytes(&msg_buf) {
-                match msg {
-                    message::Message::Bitfield(bitfield) => {
-                        println!(
-                            "Received bitfield from {}: {} bits",
-                            self.peer.ip,
-                            bitfield.len()
-                        );
-                        self.bitfield = Some(bitfield.clone());
-                        // Trigger requesting after initial bitfield
-                        self.request_rarest_piece().await;
-                    }
-                    message::Message::Have(index) => {
-                        println!("Peer {} has new piece {}", self.peer.ip, index);
-                        if let Some(ref mut bf) = self.bitfield {
-                            bf.set(index as usize, true);
-                        }
-                    }
-                    message::Message::Unchoke => {
-                        println!("Peer {} unchoked us", self.peer.ip);
-                        // Can request more blocks now
-                        self.request_rarest_piece().await;
-                    }
-                    _ => {
-                        // For now ignore other message types
-                    }
-                }
-            }
-        }
+        };
+        conn.pending_pieces = HashMap::new();
+        Ok(conn)
     }
 
-    // Stub: selects a piece from the stored bitfield and sends a request
-    async fn request_rarest_piece(&mut self) {
-        // TODO: tally availability across all peers, sort by rarity, and request blocks for the rarest one.
-        if let Some(ref bf) = self.bitfield {
-            // For now, simply pick the first available piece
-            if let Some(idx) = bf.iter().position(|b| b) {
-                let block_size = 16 * 1024;
-                let begin = 0;
-                let length = block_size as u32;
-                println!(
-                    "Requesting piece {} ({} bytes) from {}",
-                    idx, length, self.peer.ip
-                );
-                let _ = self
-                    .send_message(message::Message::Request(idx as u32, begin, length))
-                    .await;
-            }
-        }
-    }
-
-    pub async fn new(peer: PendingPeer, my_id: String, info_hash: &'static [u8]) -> Result<Self> {
-        Ok(match peer {
-            PendingPeer::Outgoing(peer) => Self::new_outgoing(peer, my_id, info_hash).await?,
-            PendingPeer::Incoming(peer, stream) => {
-                Self::new_incoming(peer, stream, my_id, info_hash).await?
-            }
-        })
-    }
-
-    async fn new_outgoing(peer: Peer, my_id: String, info_hash: &'static [u8]) -> Result<Self> {
+    async fn new_outgoing(
+        peer: Peer,
+        my_id: String,
+        info_hash: &'static [u8],
+        piece_sender: Sender<Piece>,
+        piece_length: usize,
+        piece_hashes: Vec<[u8; 20]>,
+        event_tx: UnboundedSender<PeerEvent>,
+        cmd_rx: UnboundedReceiver<SwarmCommand>,
+    ) -> Result<Self> {
         let mut stream = TcpStream::connect(format!("{}:{}", peer.ip, peer.port))
             .await
             .context("Connect to TcpStream")?;
         Self::write_handshake(&mut stream, info_hash, &my_id).await?;
         Self::read_handshake(&mut stream, info_hash).await?;
+        let have = BitVec::from_elem(piece_hashes.len(), false);
         Ok(Self {
             peer,
+            piece_sender,
+            piece_length,
+            piece_hashes,
+            pending_pieces: HashMap::new(),
             my_id,
             stream,
-            bitfield: None,
+            peer_bitfield: None,
+            have_bitfield: Some(have),
             am_choking: true,
             am_interested: false,
             peer_choking: true,
             peer_interested: false,
+            event_tx,
+            cmd_rx,
         })
     }
 
@@ -216,19 +195,130 @@ impl PeerConnection {
         mut stream: TcpStream,
         my_id: String,
         info_hash: &'static [u8],
+        piece_sender: Sender<Piece>,
+        piece_length: usize,
+        piece_hashes: Vec<[u8; 20]>,
+        event_tx: UnboundedSender<PeerEvent>,
+        cmd_rx: UnboundedReceiver<SwarmCommand>,
     ) -> Result<Self> {
         Self::read_handshake(&mut stream, info_hash).await?;
         Self::write_handshake(&mut stream, info_hash, &my_id).await?;
+        let have = BitVec::from_elem(piece_hashes.len(), false);
         Ok(Self {
             peer,
+            piece_sender,
+            piece_length,
+            piece_hashes,
+            pending_pieces: HashMap::new(),
             my_id,
             stream,
-            bitfield: None,
-            am_choking: true,
+            peer_bitfield: None,
+            have_bitfield: Some(have),
+            am_choking: false,
             am_interested: false,
             peer_choking: true,
             peer_interested: false,
+            event_tx,
+            cmd_rx,
         })
+    }
+
+    pub async fn start(&mut self) {
+        // send our bitfield then express interest
+        if let Some(ref have) = self.have_bitfield {
+            let _ = self
+                .send_message(message::Message::Bitfield(have.clone()))
+                .await;
+        }
+        self.send_message(message::Message::Interested)
+            .await
+            .expect("Failed to send Interested");
+
+        let mut len_buf = [0u8; 4];
+        loop {
+            tokio::select! {
+                Some(cmd) = self.cmd_rx.recv() => {
+                    let SwarmCommand::Request(piece, begin, length) = cmd;
+                    let _ = self.send_message(message::Message::Request(piece, begin, length)).await;
+                }
+                read = self.stream.read_exact(&mut len_buf) => {
+                    if read.is_err() { break; }
+                    let len = u32::from_be_bytes(len_buf);
+                    if len == 0 { continue; }
+                    let mut msg_buf = vec![0u8; len as usize];
+                    if self.stream.read_exact(&mut msg_buf).await.is_err() { break; }
+                    if let Ok(msg) = message::Message::from_be_bytes(&msg_buf) {
+                        match msg {
+                            message::Message::Bitfield(bf) => {
+                                self.peer_bitfield = Some(bf.clone());
+                                if self.have_bitfield.is_none() {
+                                    self.have_bitfield = Some(BitVec::from_elem(bf.len(), false));
+                                }
+                                let _ = self.event_tx.send(PeerEvent::Bitfield(self.peer.clone(), bf.clone()));
+                            }
+                            message::Message::Have(idx) => {
+                                if let Some(ref mut bf) = self.peer_bitfield {
+                                    bf.set(idx as usize, true);
+                                }
+                                let _ = self.event_tx.send(PeerEvent::Have(self.peer.clone(), idx as usize));
+                            }
+                            message::Message::Unchoke => {
+                                self.peer_choking = false;
+                                let _ = self.event_tx.send(PeerEvent::Unchoke(self.peer.clone()));
+                            }
+                            message::Message::Choke => {
+                                self.peer_choking = true;
+                                let _ = self.event_tx.send(PeerEvent::Choke(self.peer.clone()));
+                            }
+                            message::Message::Piece(piece_index, begin, block) => {
+                                println!(
+                                    "Received piece {} ({} bytes) from {}",
+                                    piece_index,
+                                    block.len(),
+                                    self.peer.ip
+                                );
+                                if let Some(ref mut have) = self.have_bitfield {
+                                    have.set(piece_index as usize, true);
+                                }
+                                let _ = self.send_message(message::Message::Have(piece_index)).await;
+                                // assemble piece blocks
+                                let blocks = self
+                                    .pending_pieces
+                                    .entry(piece_index as usize)
+                                    .or_insert_with(|| vec![None; self.piece_length.div_ceil(16384)]);
+                                let idx = begin as usize / 16384;
+                                blocks[idx] = Some(block.clone());
+                                // check if complete
+                                if blocks.iter().all(Option::is_some) {
+                                    let mut data = Vec::with_capacity(self.piece_length);
+                                    for b in blocks.iter() {
+                                        data.extend(b.as_ref().unwrap());
+                                    }
+                                    // verify hash
+                                    let mut hasher = Sha1::new();
+                                    hasher.update(&data);
+                                    if hasher.finalize().as_slice()
+                                        == self.piece_hashes[piece_index as usize]
+                                    {
+                                        self.piece_sender
+                                            .send(Piece {
+                                                index: piece_index,
+                                                data,
+                                            })
+                                            .await
+                                            .expect("Failed to send piece");
+                                    } else {
+                                        println!("Piece {} failed hash check", piece_index);
+                                    }
+                                    self.pending_pieces.remove(&(piece_index as usize));
+                                }
+                            }
+                            _ => {}
+                        }
+                    }
+                }
+            }
+        }
     }
 
     async fn write_handshake(

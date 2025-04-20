@@ -1,4 +1,4 @@
 pub struct Piece {
-    index: u32,
-    data: Vec<u8>,
+    pub index: u32,
+    pub data: Vec<u8>,
 }

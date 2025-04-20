@@ -13,7 +13,7 @@ static TORRENT: Lazy<Torrent> = Lazy::new(|| Torrent::new("test_torrents/ubuntu.
 
 #[tokio::main]
 async fn main() {
-    println!("{:?}", *TORRENT);
+    println!("Starting {:?}", TORRENT.info.name);
 
     // Build torrent client (starts p2p swarm)
     let client = Client::new(&TORRENT, 4444);

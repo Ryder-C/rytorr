@@ -19,7 +19,7 @@ pub struct Http<'a> {
     tracker_id: Option<String>,
 }
 
-impl<'a> Http<'a> {
+impl Http<'_> {
     pub fn new(
         url: String,
         info_hash: &'static [u8],
@@ -44,7 +44,7 @@ impl<'a> Http<'a> {
     }
 }
 
-impl<'a> Trackable for Http<'a> {
+impl Trackable for Http<'_> {
     fn scrape(&mut self) -> Result<TrackerResponse> {
         // Have to do this to avoid info_hash being double url encoded. Cant find a way to pass in bytes or disable url encoding in ureq.
         let request_url = format!("{}?info_hash={}", &self.url, &self.info_hash);

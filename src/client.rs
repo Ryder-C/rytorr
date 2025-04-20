@@ -1,4 +1,4 @@
-use std::{sync::Arc, thread, time::Duration};
+use std::{sync::Arc, time::Duration};
 use tokio::{
     net::TcpStream,
     sync::{
@@ -45,8 +45,14 @@ impl Client {
             peer_sender.clone(),
             peer_reciever,
             peer_id.clone(),
-            &torrent.info.hash,
             port,
+            &torrent.info.hash,
+            torrent.info.name.clone(),
+            size,
+            torrent.info.piece_length as u64,
+            torrent.info.pieces.clone(),
+            Arc::new(RwLock::new(0)),
+            Arc::new(RwLock::new(0)),
         );
 
         Self {
@@ -75,13 +81,28 @@ impl Client {
         sender: Sender<PendingPeer>,
         reciever: Receiver<PendingPeer>,
         peer_id: String,
-        info_hash: &'static [u8],
         port: u16,
+        info_hash: &'static [u8],
+        torrent_name: String,
+        size: u64,
+        piece_length: u64,
+        pieces: Vec<[u8; 20]>,
+        downloaded: Arc<RwLock<u64>>,
+        uploaded: Arc<RwLock<u64>>,
     ) {
         tokio::spawn(async move {
-            let mut swarm = Swarm::new(reciever, peer_id);
+            let mut swarm = Swarm::new(
+                reciever,
+                peer_id,
+                torrent_name,
+                size,
+                piece_length,
+                pieces,
+                downloaded.clone(),
+                uploaded.clone(),
+            );
 
-            tokio::spawn(Swarm::listen_for_peers(sender, port));
+            tokio::spawn(Swarm::listen_for_peers(sender.clone(), port));
 
             swarm.start(info_hash).await; // Loops indefinitely
         });
