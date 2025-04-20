@@ -15,6 +15,7 @@ use crate::{
 };
 use anyhow::{bail, Result};
 use rand::{distributions, Rng};
+use std::collections::HashMap;
 
 #[derive(Debug)]
 pub enum PendingPeer {
@@ -22,7 +23,7 @@ pub enum PendingPeer {
     Incoming(Peer, TcpStream),
 }
 
-pub struct Engine {
+pub struct TorrentClient {
     torrent: Arc<Torrent>,
     peer_sender: Sender<PendingPeer>,
     peer_id: String,
@@ -34,7 +35,7 @@ pub struct Engine {
     size: u64,
 }
 
-impl Engine {
+impl TorrentClient {
     pub fn new(torrent: Torrent, port: u16) -> Self {
         let torrent = Arc::new(torrent);
         let peer_id = Self::generate_peer_id();
@@ -131,13 +132,14 @@ impl Engine {
             let info_hash_clone = info_hash.clone();
 
             tokio::spawn(async move {
-                let mut tracker = match Self::create_tracker(url_clone, info_hash_clone, peer_id, port, size) {
-                    Ok(t) => t,
-                    Err(e) => {
-                        eprintln!("Failed to create tracker for {}: {}", url, e);
-                        return;
-                    }
-                };
+                let mut tracker =
+                    match Self::create_tracker(url_clone, info_hash_clone, peer_id, port, size) {
+                        Ok(t) => t,
+                        Err(e) => {
+                            eprintln!("Failed to create tracker for {}: {}", url, e);
+                            return;
+                        }
+                    };
 
                 loop {
                     tracker.update_progress(*downloaded.read().await, *uploaded.read().await);
@@ -190,6 +192,39 @@ impl Engine {
     }
 }
 
+pub struct Engine {
+    torrents: Arc<RwLock<HashMap<Vec<u8>, Arc<TorrentClient>>>>,
+    port: u16,
+}
+
+impl Engine {
+    pub fn new(port: u16) -> Self {
+        Self {
+            torrents: Arc::new(RwLock::new(HashMap::new())),
+            port,
+        }
+    }
+
+    pub async fn add_torrent(&self, torrent: Torrent) -> Result<()> {
+        let info_hash = torrent.info.hash.to_vec();
+        if self.torrents.read().await.contains_key(&info_hash) {
+            bail!("Torrent already added.");
+        }
+
+        println!("Adding torrent: {}", torrent.info.name);
+        let client = Arc::new(TorrentClient::new(torrent, self.port));
+        client.start_tracking();
+
+        self.torrents.write().await.insert(info_hash, client);
+
+        Ok(())
+    }
+
+    pub async fn torrent_count(&self) -> usize {
+        self.torrents.read().await.len()
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -197,21 +232,17 @@ mod tests {
 
     #[test]
     fn test_generate_peer_id_format() {
-        let id = Engine::generate_peer_id();
+        let id = TorrentClient::generate_peer_id();
         assert!(id.starts_with("-RY0000-"));
         assert_eq!(id.len(), 20);
     }
 
     #[test]
     fn test_create_tracker_invalid() {
-        let dummy_hash = Arc::new(vec![0u8; 20]);
-        let result = Engine::create_tracker(
-            "ftp://example.com".to_string(),
-            dummy_hash,
-            "peerid".to_string(),
-            6881,
-            100,
-        );
+        let info_hash = Arc::new(vec![0u8; 20]);
+        let peer_id = TorrentClient::generate_peer_id();
+        let result =
+            TorrentClient::create_tracker("invalid-url".to_string(), info_hash, peer_id, 6881, 100);
         assert!(result.is_err());
         let err = result.err().unwrap();
         assert!(err.to_string().contains("Unknown tracker protocol"));

@@ -1,7 +1,7 @@
 use std::{
-    collections::{HashSet, HashMap},
-    sync::Arc,
     cmp::Ordering,
+    collections::{HashMap, HashSet},
+    sync::Arc,
 };
 
 use anyhow::Result;
@@ -10,7 +10,11 @@ use bit_vec::BitVec;
 use tokio::{
     fs::OpenOptions,
     net::TcpListener,
-    sync::{Mutex, Notify, mpsc, OwnedSemaphorePermit, RwLock, Semaphore, mpsc::{UnboundedSender, UnboundedReceiver, unbounded_channel}},
+    sync::{
+        mpsc,
+        mpsc::{unbounded_channel, UnboundedReceiver, UnboundedSender},
+        Mutex, Notify, OwnedSemaphorePermit, RwLock, Semaphore,
+    },
     time::{sleep, Duration},
 };
 
@@ -46,13 +50,13 @@ pub struct Swarm {
     pieces: Arc<Vec<[u8; 20]>>,
     downloaded: Arc<RwLock<u64>>,
     uploaded: Arc<RwLock<u64>>,
-    peer_cmd_senders: HashMap<Peer, UnboundedSender<SwarmCommand>>,
+    peer_cmd_senders: Arc<Mutex<HashMap<Peer, UnboundedSender<SwarmCommand>>>>,
 }
 
 // Async task to write pieces to disk and update global have bitfield
 async fn disk_writer_loop(
     mut file: tokio::fs::File,
-    mut piece_receiver: Receiver<Piece>,
+    piece_receiver: Receiver<Piece>,
     have: Arc<Mutex<BitVec>>,
     piece_length: u64,
     num_pieces: usize,
@@ -83,8 +87,10 @@ struct PeerState {
 }
 
 /// Calculates piece rarity across all known peer bitfields.
-/// Returns a sorted list of (piece_index, count) tuples, rarest first.
-fn calculate_rarity(peer_states: &HashMap<Peer, PeerState>, num_pieces: usize) -> Vec<(usize, usize)> {
+fn calculate_rarity(
+    peer_states: &HashMap<Peer, PeerState>,
+    num_pieces: usize,
+) -> Vec<(usize, usize)> {
     let mut counts = vec![0; num_pieces];
     for state in peer_states.values() {
         for (idx, has) in state.bitfield.iter().enumerate() {
@@ -98,12 +104,12 @@ fn calculate_rarity(peer_states: &HashMap<Peer, PeerState>, num_pieces: usize) -
 
     let mut rarity: Vec<(usize, usize)> = counts.into_iter().enumerate().collect();
     // Sort by count (ascending), then index (ascending) as a tie-breaker
-    rarity.sort_unstable_by(|(idx_a, count_a), (idx_b, count_b)| {
-        match count_a.cmp(count_b) {
+    rarity.sort_unstable_by(
+        |(idx_a, count_a), (idx_b, count_b)| match count_a.cmp(count_b) {
             Ordering::Equal => idx_a.cmp(idx_b),
             other => other,
-        }
-    });
+        },
+    );
     rarity
 }
 
@@ -111,7 +117,7 @@ fn calculate_rarity(peer_states: &HashMap<Peer, PeerState>, num_pieces: usize) -
 async fn scheduler_loop(
     peer_states: Arc<Mutex<HashMap<Peer, PeerState>>>,
     global_have: Arc<Mutex<BitVec>>,
-    senders: HashMap<Peer, UnboundedSender<SwarmCommand>>,
+    senders: Arc<Mutex<HashMap<Peer, UnboundedSender<SwarmCommand>>>>,
     piece_length: usize,
     num_pieces: usize,
     notify: Arc<Notify>,
@@ -133,8 +139,6 @@ async fn scheduler_loop(
 
         let rarity = calculate_rarity(&states, num_pieces);
 
-        // Simple strategy: Iterate through rarest pieces we don't have
-        // and request the first available block from the first available peer.
         for (piece_idx, _count) in rarity {
             if have.get(piece_idx).unwrap_or(true) {
                 // We already have this piece
@@ -142,17 +146,27 @@ async fn scheduler_loop(
             }
 
             // Find an unchoked peer that has this piece
-            if let Some((peer, _state)) = states.iter().find(|(_p, s)| s.is_unchoked && s.bitfield.get(piece_idx).unwrap_or(false)) {
+            if let Some((peer, _state)) = states
+                .iter()
+                .find(|(_p, s)| s.is_unchoked && s.bitfield.get(piece_idx).unwrap_or(false))
+            {
                 // Found a candidate peer, request the first block (for now)
                 let length = piece_length as u32;
                 let block_size = 16384u32;
                 let begin = 0; // TODO: Request blocks sequentially
-                let size = if begin + block_size > length { length - begin } else { block_size };
+                let size = if begin + block_size > length {
+                    length - begin
+                } else {
+                    block_size
+                };
 
-                if let Some(tx) = senders.get(peer) {
-                    println!("Scheduler requesting piece {} block 0 from {}", piece_idx, peer.ip);
+                // Lock the senders map to get the sender
+                let senders_map = senders.lock().await;
+                if let Some(tx) = senders_map.get(peer) {
                     let _ = tx.send(SwarmCommand::Request(piece_idx as u32, begin, size));
                     break; // Move to next scheduling cycle after finding one block to request
+                } else {
+                    eprintln!("Scheduler: Error - Could not find sender for peer {} in shared map!", peer.ip);
                 }
             }
         }
@@ -167,22 +181,26 @@ async fn event_loop(
     notify: Arc<Notify>,
 ) {
     while let Some(evt) = evt_rx.recv().await {
-        println!("Received event: {:?}", evt);
         let mut states = peer_states.lock().await;
         let mut state_changed = false;
+
         match evt {
             PeerEvent::Bitfield(peer, bf) => {
-                let num_pieces = global_have.lock().await.len(); // Get expected length
-                let st = states.entry(peer.clone()).or_insert_with(|| PeerState {
-                    bitfield: BitVec::from_elem(num_pieces, false),
-                    is_unchoked: false, // Assume choked initially
+                let num_pieces = global_have.lock().await.len();
+                let st = states.entry(peer.clone()).or_insert_with(|| {
+                    PeerState {
+                        bitfield: BitVec::from_elem(num_pieces, false),
+                        is_unchoked: false,
+                    }
                 });
-                // Ensure bitfield has the correct length, resizing if necessary
                 if bf.len() == num_pieces {
                     st.bitfield = bf;
                     state_changed = true;
                 } else {
-                    println!("Warning: Received bitfield with incorrect length from {}", peer.ip);
+                    eprintln!(
+                        "EventLoop: Warning - Received bitfield with incorrect length ({}) from {} (expected {})",
+                        bf.len(), peer.ip, num_pieces
+                    );
                 }
             }
             PeerEvent::Have(peer, idx) => {
@@ -190,18 +208,26 @@ async fn event_loop(
                     if st.bitfield.get(idx).is_some_and(|b| !b) {
                         st.bitfield.set(idx, true);
                         state_changed = true;
+                    } else {
+                        eprintln!("EventLoop: Peer {} already had piece {} or index out of bounds", peer.ip, idx);
                     }
+                } else {
+                    eprintln!("EventLoop: Warning - Received Have for unknown peer {}", peer.ip);
                 }
             }
             PeerEvent::Unchoke(peer) => {
                 let num_pieces = global_have.lock().await.len();
-                let st = states.entry(peer.clone()).or_insert_with(|| PeerState {
-                    bitfield: BitVec::from_elem(num_pieces, false),
-                    is_unchoked: false,
+                let st = states.entry(peer.clone()).or_insert_with(|| {
+                    PeerState {
+                        bitfield: BitVec::from_elem(num_pieces, false),
+                        is_unchoked: false,
+                    }
                 });
                 if !st.is_unchoked {
                     st.is_unchoked = true;
                     state_changed = true;
+                } else {
+                    eprintln!("EventLoop: Peer {} was already unchoked", peer.ip);
                 }
             }
             PeerEvent::Choke(peer) => {
@@ -209,7 +235,11 @@ async fn event_loop(
                     if st.is_unchoked {
                         st.is_unchoked = false;
                         state_changed = true;
+                    } else {
+                        eprintln!("EventLoop: Peer {} was already choked", peer.ip);
                     }
+                } else {
+                    eprintln!("EventLoop: Warning - Received Choke for unknown peer {}", peer.ip);
                 }
             }
         }
@@ -242,7 +272,7 @@ impl Swarm {
             pieces,
             downloaded,
             uploaded,
-            peer_cmd_senders: HashMap::new(),
+            peer_cmd_senders: Arc::new(Mutex::new(HashMap::new())),
         }
     }
 
@@ -285,9 +315,9 @@ impl Swarm {
         let notify_clone_scheduler = notify.clone();
 
         // Central event channel
-        let (evt_tx, evt_rx): (UnboundedSender<PeerEvent>, UnboundedReceiver<PeerEvent>) = unbounded_channel();
-        let senders = self.peer_cmd_senders.clone();
-        let senders_clone_scheduler = senders.clone();
+        let (evt_tx, evt_rx): (UnboundedSender<PeerEvent>, UnboundedReceiver<PeerEvent>) =
+            unbounded_channel();
+        let senders_arc = self.peer_cmd_senders.clone();
 
         // Spawn event processing task
         tokio::spawn(event_loop(
@@ -302,7 +332,7 @@ impl Swarm {
         tokio::spawn(scheduler_loop(
             peer_states_clone_scheduler,
             have_clone_scheduler,
-            senders_clone_scheduler,
+            senders_arc,
             piece_length_usize,
             num_pieces,
             notify_clone_scheduler,
@@ -326,7 +356,7 @@ impl Swarm {
             let permit = semaphore.clone().acquire_owned().await.unwrap();
             let piece_sender = self.channel.0.clone();
             let (cmd_tx, cmd_rx) = unbounded_channel();
-            self.peer_cmd_senders.insert(peer_obj.clone(), cmd_tx);
+            self.peer_cmd_senders.lock().await.insert(peer_obj.clone(), cmd_tx);
 
             self.introduce_peer(
                 new_peer,
