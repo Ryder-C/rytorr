@@ -5,77 +5,91 @@ mod swarm;
 mod tracker;
 
 use engine::Engine;
+use futures::future::join_all;
 use std::{fs, process};
 use torrex::bencode::Torrent;
+use tracing::{error, info, warn};
 
 const TORRENT_DIR: &str = "test_torrents";
 
 #[tokio::main]
 async fn main() {
-    println!("Starting Rytorr Engine...");
+    // Initialize tracing subscriber
+    tracing_subscriber::fmt::init();
+
+    info!("Starting Rytorr Engine...");
 
     // --- Load Torrents ---
     let torrent_files = match fs::read_dir(TORRENT_DIR) {
         Ok(entries) => entries,
         Err(e) => {
-            eprintln!("Error reading torrent directory '{}': {}", TORRENT_DIR, e);
+            error!(directory = TORRENT_DIR, error = %e, "Error reading torrent directory");
             process::exit(1);
         }
     };
 
-    let mut torrents = Vec::new();
+    let mut torrents = vec![];
     for entry in torrent_files {
         let entry = match entry {
             Ok(e) => e,
             Err(e) => {
-                eprintln!("Error reading directory entry: {}", e);
+                error!(error = %e, "Error reading directory entry");
                 continue;
             }
         };
         let path = entry.path();
         if path.is_file() && path.extension().is_some_and(|ext| ext == "torrent") {
-            println!("Loading torrent file: {:?}", path);
+            info!(file_path = ?path, "Loading torrent file");
             match Torrent::new(path.to_str().unwrap()) {
                 // Assuming valid UTF-8 paths
                 Ok(torrent) => {
-                    println!("Successfully decoded: {}", torrent.info.name);
+                    info!(name = %torrent.info.name, "Successfully decoded torrent");
                     torrents.push(torrent);
                 }
                 Err(e) => {
-                    eprintln!("Failed to decode torrent file {:?}: {}", path, e);
+                    error!(file_path = ?path, error = %e, "Failed to decode torrent file");
                 }
             }
         }
     }
 
     if torrents.is_empty() {
-        println!(
-            "No valid torrent files found in '{}'. Exiting.",
-            TORRENT_DIR
+        warn!(
+            directory = TORRENT_DIR,
+            "No valid torrent files found. Exiting."
         );
         process::exit(0);
     }
 
     // --- Initialize Engine ---
-    let engine = Engine::new(4444); // Port can be configurable
+    // TODO: Make port configurable via args/config
+    let port = 4444;
+    info!(port = port, "Initializing engine");
+    let engine = Engine::new(port);
 
     // --- Add Torrents to Engine ---
+    let mut add_futures = Vec::new();
     for torrent in torrents {
-        let torrent_name = torrent.info.name.clone(); // Clone name for error message
-        if let Err(e) = engine.add_torrent(torrent).await {
-            eprintln!("Failed to add torrent '{}': {}", torrent_name, e);
+        // Add torrents concurrently
+        add_futures.push(engine.add_torrent(torrent));
+    }
+    // Wait for all add operations to complete
+    let results = join_all(add_futures).await;
+    for result in results {
+        if let Err(e) = result {
+            // We need the original torrent list to get the name here, or pass it differently
+            // For now, just log the error generically
+            error!(error = %e, "Failed to add torrent");
         }
     }
 
-    println!(
-        "Engine running with {} torrents. Press Ctrl+C to exit.",
-        engine.torrent_count().await
-    );
+    let count = engine.torrent_count().await;
+    info!(count = count, "Engine running. Press Ctrl+C to exit.");
     tokio::signal::ctrl_c()
         .await
         .expect("Failed to listen for ctrl-c");
 
-    println!("Shutting down...");
+    info!("Shutting down...");
 
     // TODO: Implement graceful shutdown for the engine and swarms
 }

@@ -3,6 +3,7 @@ use bit_vec::BitVec;
 
 const PSTR: &str = "BitTorrent protocol";
 
+#[derive(Debug)]
 pub enum Message {
     KeepAlive,
     Choke,

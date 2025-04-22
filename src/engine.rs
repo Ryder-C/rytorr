@@ -16,6 +16,7 @@ use crate::{
 use anyhow::{bail, Result};
 use rand::{distributions, Rng};
 use std::collections::HashMap;
+use tracing::{debug, error, info, instrument, warn};
 
 #[derive(Debug)]
 pub enum PendingPeer {
@@ -136,7 +137,7 @@ impl TorrentClient {
                     match Self::create_tracker(url_clone, info_hash_clone, peer_id, port, size) {
                         Ok(t) => t,
                         Err(e) => {
-                            eprintln!("Failed to create tracker for {}: {}", url, e);
+                            error!(url = %url, error = %e, "Failed to create tracker");
                             return;
                         }
                     };
@@ -146,17 +147,17 @@ impl TorrentClient {
                     let response = match tracker.scrape() {
                         Ok(r) => r,
                         Err(e) => {
-                            eprintln!("Tracker scrape error for {}: {}", url, e);
+                            error!(url = %url, error = %e, "Tracker scrape error");
                             tokio::time::sleep(Duration::from_secs(60)).await;
                             continue;
                         }
                     };
 
-                    println!("Received response from {}: {:?}", url, response);
+                    debug!(url = %url, ?response, "Received response from tracker");
 
                     for peer in response.peers {
                         if let Err(e) = sender.send(PendingPeer::Outgoing(peer)).await {
-                            eprintln!("Failed to send peer to swarm: {}", e);
+                            error!(error = %e, "Failed to send peer to swarm");
                             break;
                         }
                     }
@@ -205,13 +206,15 @@ impl Engine {
         }
     }
 
+    #[instrument(skip(self, torrent), fields(torrent_name = %torrent.info.name, info_hash = ?torrent.info.hash))]
     pub async fn add_torrent(&self, torrent: Torrent) -> Result<()> {
         let info_hash = torrent.info.hash.to_vec();
         if self.torrents.read().await.contains_key(&info_hash) {
+            warn!("Torrent already added.");
             bail!("Torrent already added.");
         }
 
-        println!("Adding torrent: {}", torrent.info.name);
+        info!("Adding torrent");
         let client = Arc::new(TorrentClient::new(torrent, self.port));
         client.start_tracking();
 
@@ -235,6 +238,7 @@ mod tests {
         let id = TorrentClient::generate_peer_id();
         assert!(id.starts_with("-RY0000-"));
         assert_eq!(id.len(), 20);
+        assert!(id[8..].chars().all(char::is_alphanumeric));
     }
 
     #[test]

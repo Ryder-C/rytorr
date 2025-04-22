@@ -16,6 +16,7 @@ use tokio::{
     net::TcpStream,
     sync::mpsc::{UnboundedReceiver, UnboundedSender},
 };
+use tracing::{debug, error, info, trace, warn};
 
 #[derive(Debug, Clone)]
 pub struct Peer {
@@ -223,104 +224,228 @@ impl PeerConnection {
         })
     }
 
+    #[tracing::instrument(skip(self))]
     pub async fn start(&mut self) {
         // send our bitfield then express interest
         if let Some(ref have) = self.have_bitfield {
-            let _ = self
+            debug!("Sending initial Bitfield");
+            if let Err(e) = self
                 .send_message(message::Message::Bitfield(have.clone()))
-                .await;
+                .await
+            {
+                error!(error = %e, "Failed to send initial Bitfield");
+                return; // Can't proceed without sending bitfield
+            }
         }
-        self.send_message(message::Message::Interested)
-            .await
-            .expect("Failed to send Interested");
+        debug!("Sending Interested");
+        if let Err(e) = self.send_message(message::Message::Interested).await {
+            error!(error = %e, "Failed to send Interested");
+            return; // Can't proceed if we can't express interest
+        }
 
         let mut len_buf = [0u8; 4];
         loop {
+            trace!("Peer loop waiting for command or message");
             tokio::select! {
+                // Biased select ensures we prioritize sending commands over reading messages if both are ready
+                // This might be desirable for responsiveness to requests
+                biased;
                 Some(cmd) = self.cmd_rx.recv() => {
-                    let SwarmCommand::Request(piece, begin, length) = cmd;
-                    let _ = self.send_message(message::Message::Request(piece, begin, length)).await;
+                    match cmd {
+                        SwarmCommand::Request(piece, begin, length) => {
+                            debug!(piece_index = piece, begin, length, "Received Request command from swarm");
+                            if let Err(e) = self.send_message(message::Message::Request(piece, begin, length)).await {
+                                error!(error = %e, "Failed to send Request message");
+                                // Consider breaking the loop or notifying swarm of failure
+                            }
+                        }
+                    }
                 }
-                read = self.stream.read_exact(&mut len_buf) => {
-                    if read.is_err() { break; }
-                    let len = u32::from_be_bytes(len_buf);
-                    if len == 0 { continue; }
-                    let mut msg_buf = vec![0u8; len as usize];
-                    if self.stream.read_exact(&mut msg_buf).await.is_err() { break; }
-                    if let Ok(msg) = message::Message::from_be_bytes(&msg_buf) {
-                        match msg {
-                            message::Message::Bitfield(bf) => {
-                                self.peer_bitfield = Some(bf.clone());
-                                if self.have_bitfield.is_none() {
-                                    self.have_bitfield = Some(BitVec::from_elem(bf.len(), false));
-                                }
-                                let _ = self.event_tx.send(PeerEvent::Bitfield(self.peer.clone(), bf.clone()));
+                read_result = self.stream.read_exact(&mut len_buf) => {
+                    match read_result {
+                        Ok(_) => {
+                            let len = u32::from_be_bytes(len_buf);
+                            trace!(message_len = len, "Received message length");
+                            if len == 0 {
+                                debug!("Received KeepAlive");
+                                continue; // KeepAlive, just continue loop
                             }
-                            message::Message::Have(idx) => {
-                                if let Some(ref mut bf) = self.peer_bitfield {
-                                    bf.set(idx as usize, true);
-                                }
-                                let _ = self.event_tx.send(PeerEvent::Have(self.peer.clone(), idx as usize));
+                            let mut msg_buf = vec![0u8; len as usize];
+                            if let Err(e) = self.stream.read_exact(&mut msg_buf).await {
+                                error!(error = %e, "Failed to read message body");
+                                break; // Assume connection is broken
                             }
-                            message::Message::Unchoke => {
-                                self.peer_choking = false;
-                                let _ = self.event_tx.send(PeerEvent::Unchoke(self.peer.clone()));
-                            }
-                            message::Message::Choke => {
-                                self.peer_choking = true;
-                                let _ = self.event_tx.send(PeerEvent::Choke(self.peer.clone()));
-                            }
-                            message::Message::Piece(piece_index, begin, block) => {
-                                println!(
-                                    "Received piece {} ({} bytes) from {}",
-                                    piece_index,
-                                    block.len(),
-                                    self.peer.ip
-                                );
-                                if let Some(ref mut have) = self.have_bitfield {
-                                    have.set(piece_index as usize, true);
-                                }
-                                let _ = self.send_message(message::Message::Have(piece_index)).await;
-                                // assemble piece blocks
-                                let blocks = self
-                                    .pending_pieces
-                                    .entry(piece_index as usize)
-                                    .or_insert_with(|| vec![None; self.piece_length.div_ceil(16384)]);
-                                let idx = begin as usize / 16384;
-                                blocks[idx] = Some(block.clone());
-                                // check if complete
-                                if blocks.iter().all(Option::is_some) {
-                                    let mut data = Vec::with_capacity(self.piece_length);
-                                    for b in blocks.iter() {
-                                        data.extend(b.as_ref().unwrap());
-                                    }
-                                    // verify hash
-                                    let mut hasher = Sha1::new();
-                                    hasher.update(&data);
-                                    if hasher.finalize().as_slice()
-                                        == self.piece_hashes[piece_index as usize]
-                                    {
-                                        self.piece_sender
-                                            .send(Piece {
-                                                index: piece_index,
-                                                data,
-                                            })
-                                            .await
-                                            .expect("Failed to send piece");
-                                    } else {
-                                        println!("Piece {} failed hash check", piece_index);
-                                    }
-                                    self.pending_pieces.remove(&(piece_index as usize));
+                            match message::Message::from_be_bytes(&msg_buf) {
+                                Ok(msg) => self.handle_message(msg).await,
+                                Err(e) => {
+                                    error!(error = %e, "Failed to parse message");
+                                    // Decide whether to break or continue
                                 }
                             }
-                            _ => {}
+                        },
+                        Err(e) => {
+                            info!(error = %e, "Connection closed by peer or read error");
+                            break; // Exit loop on read error
                         }
                     }
                 }
             }
         }
+        info!(peer.ip = %self.peer.ip, "Peer connection loop finished");
     }
 
+    #[tracing::instrument(skip(self, msg), fields(peer.ip = %self.peer.ip))]
+    async fn handle_message(&mut self, msg: message::Message) {
+        match msg {
+            message::Message::KeepAlive => trace!("Received KeepAlive"),
+            message::Message::Choke => {
+                debug!("Received Choke");
+                self.peer_choking = true;
+                let _ = self.event_tx.send(PeerEvent::Choke(self.peer.clone()));
+            }
+            message::Message::Unchoke => {
+                debug!("Received Unchoke");
+                self.peer_choking = false;
+                let _ = self.event_tx.send(PeerEvent::Unchoke(self.peer.clone()));
+            }
+            message::Message::Interested => {
+                debug!("Received Interested");
+                self.peer_interested = true;
+                // TODO: Implement unchoking logic (send Unchoke if we want to serve this peer)
+                // if !self.am_choking { ... send Unchoke ... }
+            }
+            message::Message::NotInterested => {
+                debug!("Received NotInterested");
+                self.peer_interested = false;
+            }
+            message::Message::Have(idx) => {
+                debug!(piece_index = idx, "Received Have");
+                if let Some(ref mut bf) = self.peer_bitfield {
+                    if idx < bf.len() as u32 {
+                        // Check bounds
+                        bf.set(idx as usize, true);
+                    } else {
+                        warn!(
+                            piece_index = idx,
+                            bitfield_len = bf.len(),
+                            "Received Have for index out of bounds"
+                        );
+                    }
+                } else {
+                    // We should ideally wait for Bitfield first, but can handle Have anyway
+                    warn!("Received Have before Bitfield");
+                }
+                let _ = self
+                    .event_tx
+                    .send(PeerEvent::Have(self.peer.clone(), idx as usize));
+            }
+            message::Message::Bitfield(bf) => {
+                debug!(bitfield_len = bf.len(), "Received Bitfield");
+                if self.peer_bitfield.is_some() {
+                    warn!("Received Bitfield message twice");
+                    // Maybe disconnect peer? For now, just overwrite.
+                }
+                // TODO: Verify bitfield length against number of pieces from torrent info
+                self.peer_bitfield = Some(bf.clone());
+                let _ = self
+                    .event_tx
+                    .send(PeerEvent::Bitfield(self.peer.clone(), bf));
+            }
+            message::Message::Request(idx, begin, len) => {
+                debug!(piece_index = idx, begin, len, "Received Request");
+                // TODO: Implement logic to read from file and send Piece message
+                warn!("Piece request handling not implemented");
+            }
+            message::Message::Piece(piece_index, begin, block) => {
+                // Use debug level for block receipt, info for completion/verification
+                debug!(
+                    piece_index,
+                    begin,
+                    block_len = block.len(),
+                    "Received Piece block"
+                );
+                // TODO: Need a more robust way to track requested blocks/pieces
+                // to verify this piece is one we actually asked for.
+                // assemble piece blocks
+                let num_blocks = self.piece_length.div_ceil(16384); // Assuming 16 KiB blocks
+                let blocks = self
+                    .pending_pieces
+                    .entry(piece_index as usize)
+                    .or_insert_with(|| vec![None; num_blocks]);
+                let block_index = begin as usize / 16384;
+                if block_index >= blocks.len() {
+                    error!(
+                        piece_index,
+                        begin,
+                        block_len = block.len(),
+                        num_blocks,
+                        "Received block with invalid begin offset"
+                    );
+                    return;
+                }
+                if blocks[block_index].is_some() {
+                    warn!(piece_index, block_index, "Received duplicate block");
+                    // Potentially ignore or handle as error
+                }
+                blocks[block_index] = Some(block);
+                // check if complete
+                if blocks.iter().all(Option::is_some) {
+                    trace!(piece_index, "All blocks received, assembling piece");
+                    let mut data = Vec::with_capacity(self.piece_length);
+                    for b_opt in blocks.iter() {
+                        // Use unwrap_unchecked assuming all are Some due to all() check
+                        data.extend(unsafe { b_opt.as_ref().unwrap_unchecked() });
+                    }
+                    // TODO: Adjust data length if it's the last piece and shorter than piece_length
+                    // verify hash
+                    trace!(piece_index, "Verifying piece hash");
+                    let mut hasher = Sha1::new();
+                    hasher.update(&data);
+                    let calculated_hash = hasher.finalize();
+                    let expected_hash = &self.piece_hashes[piece_index as usize];
+                    if calculated_hash.as_slice() == expected_hash {
+                        // Use info level for successful verification
+                        info!(
+                            piece_index,
+                            data_len = data.len(),
+                            "Piece completed and verified"
+                        );
+                        // Send to swarm/disk writer
+                        if let Err(e) = self
+                            .piece_sender
+                            .send(Piece {
+                                index: piece_index,
+                                data,
+                            })
+                            .await
+                        {
+                            error!(error = %e, piece_index, "Failed to send completed piece to swarm");
+                            // If channel is closed, maybe we should stop the connection?
+                        }
+                        // TODO: Send Have message? Update local bitfield?
+                    } else {
+                        // Use error level for failed verification
+                        error!(piece_index, expected_hash = ?expected_hash, calculated_hash = ?calculated_hash.as_slice(), "Piece failed hash check!");
+                        // TODO: Discard piece data, re-request blocks, potentially penalize peer
+                    }
+                    // Remove from pending pieces regardless of verification result
+                    self.pending_pieces.remove(&(piece_index as usize));
+                }
+            }
+            message::Message::Cancel(idx, begin, len) => {
+                debug!(piece_index = idx, begin, len, "Received Cancel");
+                // TODO: Implement cancellation logic if supporting pipelined requests
+                warn!("Cancel handling not implemented");
+            }
+            message::Message::Port(port) => {
+                debug!(dht_port = port, "Received Port message (DHT)");
+                // TODO: Implement DHT integration if needed
+                warn!("Port message handling not implemented");
+            }
+        }
+    }
+
+    #[tracing::instrument(skip(stream, info_hash, peer_id))]
     async fn write_handshake(
         stream: &mut TcpStream,
         info_hash: &[u8],
@@ -339,6 +464,7 @@ impl PeerConnection {
         stream.write_all(&buf).await.context("Write handshake")
     }
 
+    #[tracing::instrument(skip(stream, info_hash))]
     pub async fn read_handshake(stream: &mut TcpStream, info_hash: &[u8]) -> Result<()> {
         let mut response = [0u8; 49 + Self::PSTR.len()];
         stream
@@ -362,9 +488,10 @@ impl PeerConnection {
         Ok(())
     }
 
+    #[tracing::instrument(skip(self, message), fields(message_type = std::any::type_name::<message::Message>()))]
     async fn send_message(&mut self, message: message::Message) -> Result<()> {
-        let bytes = message.to_be_bytes();
-        self.stream.write_all(&bytes).await?;
+        let payload = message.to_be_bytes();
+        self.stream.write_all(&payload).await?;
         Ok(())
     }
 }
