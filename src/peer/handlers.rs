@@ -1,7 +1,6 @@
 use crate::{
-    engine::PendingPeer,
     file::Piece,
-    peer::{message, Peer, PeerConnection, BLOCK_SIZE},
+    peer::{PeerConnection, BLOCK_SIZE},
     swarm::{
         BitfieldEventHandler, ChokeEventHandler, HaveEventHandler, PeerEventHandler,
         UnchokeEventHandler,
@@ -10,9 +9,6 @@ use crate::{
 use async_trait::async_trait;
 use bit_vec::BitVec;
 use sha1::{Digest, Sha1};
-use std::collections::HashMap;
-use std::sync::Arc;
-use tokio::sync::mpsc::UnboundedSender;
 use tracing::{debug, error, info, trace, warn};
 
 // Define the trait that all message handlers will implement.

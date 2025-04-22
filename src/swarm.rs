@@ -2,6 +2,7 @@ use std::{
     cmp::Ordering,
     collections::{HashMap, HashSet},
     sync::Arc,
+    time::Instant,
 };
 
 use anyhow::Result;
@@ -27,6 +28,7 @@ use crate::{
 };
 
 const MAX_CONCURRENT_HANDSHAKES: usize = 10;
+const REQUEST_TIMEOUT: Duration = Duration::from_secs(10);
 
 #[derive(Debug, Clone)]
 pub enum PeerEvent {
@@ -164,8 +166,10 @@ async fn scheduler_loop(
     num_pieces: usize,
     notify: Arc<Notify>,
 ) {
-    // Track the next block offset to request for each piece index
+    // Track the next block offset we expect to receive for each piece index
     let mut piece_download_progress: HashMap<usize, u32> = HashMap::new();
+    // Track blocks requested but not yet confirmed received
+    let mut pending_requests: HashMap<(usize, u32), Instant> = HashMap::new(); // (piece_idx, begin) -> time
 
     loop {
         // Wait for a state change notification or a timeout (e.g., 1 second)
@@ -173,6 +177,23 @@ async fn scheduler_loop(
             _ = notify.notified() => { debug!("Scheduler notified"); }
             _ = sleep(Duration::from_secs(1)) => { debug!("Scheduler timeout"); }
         }
+
+        // --- Timeout check for pending requests ---
+        let now = Instant::now();
+        pending_requests.retain(|(idx, begin), requested_at| {
+            let elapsed = now.duration_since(*requested_at);
+            if elapsed > REQUEST_TIMEOUT {
+                warn!(
+                    piece_index = idx,
+                    block_offset = begin,
+                    timeout_secs = REQUEST_TIMEOUT.as_secs(),
+                    "Request timed out, removing from pending."
+                );
+                false // Remove from pending_requests
+            } else {
+                true // Keep in pending_requests
+            }
+        });
 
         let states = peer_states.lock().await;
         let have = global_have.lock().await;
@@ -204,15 +225,17 @@ async fn scheduler_loop(
                 // Get the next block offset for this piece, default to 0 if not tracked yet
                 let begin = *piece_download_progress.entry(piece_idx).or_insert(0);
 
-                // Check if we already requested all blocks for this piece
+                // Check if we already received all blocks for this piece (according to progress)
                 if begin >= piece_len_u32 {
-                    debug!(
-                        piece_index = piece_idx,
-                        "All blocks already requested, skipping"
-                    );
-                    // We might have received the piece data but `global_have` hasn't updated yet.
-                    // Or we finished requesting, let's try another piece.
                     continue;
+                }
+
+                // --- Check if this specific block is already pending ---
+                let block_key = (piece_idx, begin);
+                if let Some(requested_at) = pending_requests.get(&block_key) {
+                    // Already requested and not timed out (timeout check happened above)
+                    trace!(piece_index = piece_idx, block_offset = begin, requested_ago = ?now.duration_since(*requested_at), "Block already pending, skipping");
+                    continue; // Skip this block, try next piece/peer
                 }
 
                 // Calculate block size, handling the last potentially smaller block
@@ -225,7 +248,6 @@ async fn scheduler_loop(
                 // Lock the senders map to get the sender
                 let senders_map = senders.lock().await;
                 if let Some(tx) = senders_map.get(peer) {
-                    debug!(piece_index = piece_idx, begin, size, peer.ip = %peer.ip, "Sending Request");
                     // Create the handler struct and box it
                     let boxed_handler = Box::new(crate::peer::RequestCommandHandler {
                         piece: piece_idx as u32,
@@ -233,24 +255,13 @@ async fn scheduler_loop(
                         length: size,
                     });
 
+                    debug!(piece_index = piece_idx, begin, size, peer.ip = %peer.ip, "Sending Request");
                     if let Err(e) = tx.send(boxed_handler) {
                         error!(error = %e, peer.ip = %peer.ip, "Failed to send Request command handler");
-                        // If sending fails, maybe don't update progress? Or remove peer? For now, just log.
                     } else {
-                        // Update progress only if send succeeded
-                        let next_offset = begin + size;
-                        if next_offset >= piece_len_u32 {
-                            info!(piece_index = piece_idx, "Requested last block of piece");
-                            // Mark as complete by setting offset >= piece_len (or remove)
-                            piece_download_progress.insert(piece_idx, next_offset);
-                        } else {
-                            piece_download_progress.insert(piece_idx, next_offset);
-                        }
-
+                        // Add to pending requests
+                        pending_requests.insert(block_key, Instant::now());
                         requested_this_cycle = true;
-                        // For simplicity, we still only request one block per peer per cycle.
-                        // A more advanced scheduler could pipeline requests.
-                        break;
                     }
                 } else {
                     // This error should be rare if the state is consistent

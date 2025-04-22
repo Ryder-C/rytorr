@@ -6,19 +6,18 @@ use std::{hash::Hash, net::SocketAddr, sync::Arc};
 
 use crate::engine::PendingPeer;
 use crate::file::Piece;
-use crate::swarm::{PeerEvent, PeerEventHandler, SwarmCommand};
+use crate::swarm::PeerEventHandler;
 use anyhow::{ensure, Context, Result};
 use async_channel::Sender;
 use async_trait::async_trait;
 use bendy::decoding::FromBencode;
 use bit_vec::BitVec;
-use sha1::{Digest, Sha1};
 use tokio::{
     io::{AsyncReadExt, AsyncWriteExt},
     net::TcpStream,
     sync::mpsc::{UnboundedReceiver, UnboundedSender},
 };
-use tracing::{debug, error, info, trace, warn};
+use tracing::{debug, error, info, trace};
 
 use crate::peer::handlers::MessageHandler;
 use crate::peer::message::from_bytes_to_handler;
