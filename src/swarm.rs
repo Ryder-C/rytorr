@@ -6,6 +6,7 @@ use std::{
 
 use anyhow::Result;
 use async_channel::{Receiver, Sender};
+use async_trait::async_trait;
 use bit_vec::BitVec;
 use tokio::{
     fs::OpenOptions,
@@ -22,7 +23,7 @@ use tracing::{debug, error, info, instrument, trace, warn, Instrument};
 use crate::{
     engine::PendingPeer,
     file::Piece,
-    peer::{Peer, PeerConnection, BLOCK_SIZE},
+    peer::{Peer, PeerConnection, SwarmCommandHandler, BLOCK_SIZE},
 };
 
 const MAX_CONCURRENT_HANDSHAKES: usize = 10;
@@ -50,7 +51,8 @@ pub struct Swarm {
     pieces: Arc<Vec<[u8; 20]>>,
     downloaded: Arc<RwLock<u64>>,
     uploaded: Arc<RwLock<u64>>,
-    peer_cmd_senders: Arc<Mutex<HashMap<Peer, UnboundedSender<SwarmCommand>>>>,
+    peer_cmd_senders:
+        Arc<Mutex<HashMap<Peer, UnboundedSender<Box<dyn SwarmCommandHandler + Send>>>>>,
 }
 
 // Async task to write pieces to disk and update global have bitfield
@@ -117,7 +119,7 @@ async fn disk_writer_loop(
 
 /// Per-peer state tracked by the Swarm
 #[derive(Clone, Debug)]
-struct PeerState {
+pub(crate) struct PeerState {
     bitfield: BitVec,
     is_unchoked: bool,
 }
@@ -157,7 +159,7 @@ fn calculate_rarity(
 async fn scheduler_loop(
     peer_states: Arc<Mutex<HashMap<Peer, PeerState>>>,
     global_have: Arc<Mutex<BitVec>>,
-    senders: Arc<Mutex<HashMap<Peer, UnboundedSender<SwarmCommand>>>>,
+    senders: Arc<Mutex<HashMap<Peer, UnboundedSender<Box<dyn SwarmCommandHandler + Send>>>>>,
     piece_length: usize,
     num_pieces: usize,
     notify: Arc<Notify>,
@@ -224,8 +226,15 @@ async fn scheduler_loop(
                 let senders_map = senders.lock().await;
                 if let Some(tx) = senders_map.get(peer) {
                     debug!(piece_index = piece_idx, begin, size, peer.ip = %peer.ip, "Sending Request");
-                    if let Err(e) = tx.send(SwarmCommand::Request(piece_idx as u32, begin, size)) {
-                        error!(error = %e, peer.ip = %peer.ip, "Failed to send Request command");
+                    // Create the handler struct and box it
+                    let boxed_handler = Box::new(crate::peer::RequestCommandHandler {
+                        piece: piece_idx as u32,
+                        begin,
+                        length: size,
+                    });
+
+                    if let Err(e) = tx.send(boxed_handler) {
+                        error!(error = %e, peer.ip = %peer.ip, "Failed to send Request command handler");
                         // If sending fails, maybe don't update progress? Or remove peer? For now, just log.
                     } else {
                         // Update progress only if send succeeded
@@ -255,91 +264,162 @@ async fn scheduler_loop(
     }
 }
 
+// --- Peer Event Handling ---
+
+#[async_trait]
+pub(crate) trait PeerEventHandler: Send {
+    async fn handle(
+        &self,
+        states: &Mutex<HashMap<Peer, PeerState>>,
+        global_have: &Mutex<BitVec>,
+        notify: &Notify,
+    );
+}
+
+pub(crate) struct BitfieldEventHandler {
+    pub(crate) peer: Peer,
+    pub(crate) bf: BitVec,
+}
+
+#[async_trait]
+impl PeerEventHandler for BitfieldEventHandler {
+    async fn handle(
+        &self,
+        states: &Mutex<HashMap<Peer, PeerState>>,
+        global_have: &Mutex<BitVec>,
+        notify: &Notify,
+    ) {
+        let num_pieces = global_have.lock().await.len();
+        let mut states_guard = states.lock().await;
+        let st = states_guard.entry(self.peer.clone()).or_insert_with(|| {
+            debug!(peer.ip = %self.peer.ip, "EventLoop: Creating new state for Bitfield");
+            PeerState {
+                bitfield: BitVec::from_elem(num_pieces, false),
+                is_unchoked: false, // Default state
+            }
+        });
+        if self.bf.len() == num_pieces {
+            st.bitfield = self.bf.clone();
+            notify.notify_one(); // State potentially changed
+            debug!(peer.ip = %self.peer.ip, num_pieces, "EventLoop: Updated bitfield");
+        } else {
+            warn!(
+                peer.ip = %self.peer.ip,
+                received_len = self.bf.len(),
+                expected_len = num_pieces,
+                "EventLoop: Received bitfield with incorrect length"
+            );
+        }
+    }
+}
+
+pub(crate) struct HaveEventHandler {
+    pub(crate) peer: Peer,
+    pub(crate) idx: usize,
+}
+
+#[async_trait]
+impl PeerEventHandler for HaveEventHandler {
+    async fn handle(
+        &self,
+        states: &Mutex<HashMap<Peer, PeerState>>,
+        _global_have: &Mutex<BitVec>, // Not needed directly, but part of the signature
+        notify: &Notify,
+    ) {
+        let mut states_guard = states.lock().await;
+        if let Some(st) = states_guard.get_mut(&self.peer) {
+            if st.bitfield.get(self.idx).is_some_and(|b| !b) {
+                st.bitfield.set(self.idx, true);
+                notify.notify_one(); // State potentially changed
+                debug!(peer.ip = %self.peer.ip, piece_index = self.idx, "EventLoop: Set piece");
+            } else {
+                // Log if already had or index is bad, but don't warn for unknown peer here
+                trace!(peer.ip = %self.peer.ip, piece_index = self.idx, "EventLoop: Peer already had piece or index out of bounds");
+            }
+        } else {
+            // If peer is unknown when receiving Have, it's less critical than Bitfield/Choke/Unchoke
+            // Might happen if peer disconnects just before event processing.
+            debug!(peer.ip = %self.peer.ip, "EventLoop: Received Have for peer not in state map (might have disconnected)");
+        }
+    }
+}
+
+pub(crate) struct UnchokeEventHandler {
+    pub(crate) peer: Peer,
+}
+
+#[async_trait]
+impl PeerEventHandler for UnchokeEventHandler {
+    async fn handle(
+        &self,
+        states: &Mutex<HashMap<Peer, PeerState>>,
+        global_have: &Mutex<BitVec>,
+        notify: &Notify,
+    ) {
+        let num_pieces = global_have.lock().await.len();
+        let mut states_guard = states.lock().await;
+        let st = states_guard.entry(self.peer.clone()).or_insert_with(|| {
+            debug!(peer.ip = %self.peer.ip, "EventLoop: Creating new state for Unchoke");
+            PeerState {
+                bitfield: BitVec::from_elem(num_pieces, false),
+                is_unchoked: false,
+            }
+        });
+        if !st.is_unchoked {
+            st.is_unchoked = true;
+            notify.notify_one(); // State changed
+            debug!(peer.ip = %self.peer.ip, "EventLoop: Unchoked peer");
+        } else {
+            trace!(peer.ip = %self.peer.ip, "EventLoop: Peer was already unchoked");
+        }
+    }
+}
+
+pub(crate) struct ChokeEventHandler {
+    pub(crate) peer: Peer,
+}
+
+#[async_trait]
+impl PeerEventHandler for ChokeEventHandler {
+    async fn handle(
+        &self,
+        states: &Mutex<HashMap<Peer, PeerState>>,
+        _global_have: &Mutex<BitVec>,
+        notify: &Notify,
+    ) {
+        let mut states_guard = states.lock().await;
+        if let Some(st) = states_guard.get_mut(&self.peer) {
+            if st.is_unchoked {
+                st.is_unchoked = false;
+                notify.notify_one(); // State changed
+                debug!(peer.ip = %self.peer.ip, "EventLoop: Choked peer");
+            } else {
+                trace!(peer.ip = %self.peer.ip, "EventLoop: Peer was already choked");
+            }
+        } else {
+            debug!(peer.ip = %self.peer.ip, "EventLoop: Received Choke for peer not in state map (might have disconnected)");
+        }
+    }
+}
+
 // Async task to handle peer events and update state
 #[instrument(skip_all)]
 async fn event_loop(
-    mut evt_rx: UnboundedReceiver<PeerEvent>,
+    mut evt_rx: UnboundedReceiver<Box<dyn PeerEventHandler + Send>>,
     peer_states: Arc<Mutex<HashMap<Peer, PeerState>>>,
     global_have: Arc<Mutex<BitVec>>,
     notify: Arc<Notify>,
 ) {
-    while let Some(evt) = evt_rx.recv().await {
-        debug!(event = ?evt, "EventLoop: Received event");
-        let mut states = peer_states.lock().await;
-        let mut state_changed = false;
+    while let Some(evt_handler) = evt_rx.recv().await {
+        debug!(
+            event_type = std::any::type_name_of_val(&*evt_handler),
+            "EventLoop: Received event handler"
+        );
 
-        match evt {
-            PeerEvent::Bitfield(peer, bf) => {
-                let num_pieces = global_have.lock().await.len();
-                let st = states.entry(peer.clone()).or_insert_with(|| {
-                    debug!(peer.ip = %peer.ip, "EventLoop: Creating new state");
-                    PeerState {
-                        bitfield: BitVec::from_elem(num_pieces, false),
-                        is_unchoked: false,
-                    }
-                });
-                if bf.len() == num_pieces {
-                    st.bitfield = bf;
-                    state_changed = true;
-                    debug!(peer.ip = %peer.ip, num_pieces, "EventLoop: Updated bitfield");
-                } else {
-                    warn!(
-                        peer.ip = %peer.ip,
-                        received_len = bf.len(),
-                        expected_len = num_pieces,
-                        "EventLoop: Received bitfield with incorrect length"
-                    );
-                }
-            }
-            PeerEvent::Have(peer, idx) => {
-                if let Some(st) = states.get_mut(&peer) {
-                    if st.bitfield.get(idx).is_some_and(|b| !b) {
-                        st.bitfield.set(idx, true);
-                        state_changed = true;
-                        debug!(peer.ip = %peer.ip, piece_index = idx, "EventLoop: Set piece");
-                    } else {
-                        debug!(peer.ip = %peer.ip, piece_index = idx, "EventLoop: Peer already had piece or index out of bounds");
-                    }
-                } else {
-                    warn!(peer.ip = %peer.ip, "EventLoop: Received Have for unknown peer");
-                }
-            }
-            PeerEvent::Unchoke(peer) => {
-                let num_pieces = global_have.lock().await.len();
-                let st = states.entry(peer.clone()).or_insert_with(|| {
-                    debug!(peer.ip = %peer.ip, "EventLoop: Creating new state");
-                    PeerState {
-                        bitfield: BitVec::from_elem(num_pieces, false),
-                        is_unchoked: false,
-                    }
-                });
-                if !st.is_unchoked {
-                    st.is_unchoked = true;
-                    state_changed = true;
-                    debug!(peer.ip = %peer.ip, "EventLoop: Unchoked peer");
-                } else {
-                    debug!(peer.ip = %peer.ip, "EventLoop: Peer was already unchoked");
-                }
-            }
-            PeerEvent::Choke(peer) => {
-                if let Some(st) = states.get_mut(&peer) {
-                    if st.is_unchoked {
-                        st.is_unchoked = false;
-                        state_changed = true;
-                        debug!(peer.ip = %peer.ip, "EventLoop: Choked peer");
-                    } else {
-                        debug!(peer.ip = %peer.ip, "EventLoop: Peer was already choked");
-                    }
-                } else {
-                    warn!(peer.ip = %peer.ip, "EventLoop: Received Choke for unknown peer");
-                }
-            }
-        }
-
-        if state_changed {
-            debug!("EventLoop: Notifying scheduler");
-            notify.notify_one();
-        }
+        // Call the handler's handle method directly
+        evt_handler
+            .handle(&peer_states, &global_have, &notify)
+            .await;
     }
     info!("Event loop finished");
 }
@@ -403,8 +483,10 @@ impl Swarm {
         let notify_clone_scheduler = notify.clone();
 
         // Central event channel
-        let (evt_tx, evt_rx): (UnboundedSender<PeerEvent>, UnboundedReceiver<PeerEvent>) =
-            unbounded_channel();
+        let (evt_tx, evt_rx): (
+            UnboundedSender<Box<dyn PeerEventHandler + Send>>,
+            UnboundedReceiver<Box<dyn PeerEventHandler + Send>>,
+        ) = unbounded_channel();
         let senders_arc = self.peer_cmd_senders.clone();
 
         info!("Spawning event processing task");
@@ -525,8 +607,8 @@ impl Swarm {
         piece_sender: Sender<Piece>,
         piece_length: usize,
         piece_hashes: Arc<Vec<[u8; 20]>>,
-        peer_event_tx: UnboundedSender<PeerEvent>,
-        cmd_rx: UnboundedReceiver<SwarmCommand>,
+        peer_event_tx: UnboundedSender<Box<dyn PeerEventHandler + Send>>,
+        cmd_rx: UnboundedReceiver<Box<dyn SwarmCommandHandler + Send>>,
     ) {
         let id = self.my_id.clone();
         let peer_ip_for_task = match &peer {
