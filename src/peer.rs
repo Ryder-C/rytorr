@@ -18,6 +18,8 @@ use tokio::{
 };
 use tracing::{debug, error, info, trace, warn};
 
+pub const BLOCK_SIZE: usize = 16384;
+
 #[derive(Debug, Clone)]
 pub struct Peer {
     pub peer_id: Option<String>,
@@ -367,12 +369,12 @@ impl PeerConnection {
                 // TODO: Need a more robust way to track requested blocks/pieces
                 // to verify this piece is one we actually asked for.
                 // assemble piece blocks
-                let num_blocks = self.piece_length.div_ceil(16384); // Assuming 16 KiB blocks
+                let num_blocks = self.piece_length.div_ceil(BLOCK_SIZE); // Assuming 16 KiB blocks
                 let blocks = self
                     .pending_pieces
                     .entry(piece_index as usize)
                     .or_insert_with(|| vec![None; num_blocks]);
-                let block_index = begin as usize / 16384;
+                let block_index = begin as usize / BLOCK_SIZE;
                 if block_index >= blocks.len() {
                     error!(
                         piece_index,

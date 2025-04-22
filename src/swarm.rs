@@ -19,13 +19,13 @@ use tokio::{
 };
 use tracing::{debug, error, info, instrument, trace, warn, Instrument};
 
-const MAX_CONCURRENT_HANDSHAKES: usize = 10;
-
 use crate::{
     engine::PendingPeer,
     file::Piece,
-    peer::{Peer, PeerConnection},
+    peer::{Peer, PeerConnection, BLOCK_SIZE},
 };
+
+const MAX_CONCURRENT_HANDSHAKES: usize = 10;
 
 #[derive(Debug, Clone)]
 pub enum PeerEvent {
@@ -46,7 +46,6 @@ pub struct Swarm {
     peers: HashSet<Peer>,
     my_id: String,
     torrent_name: String,
-    size: u64,
     piece_length: u64,
     pieces: Arc<Vec<[u8; 20]>>,
     downloaded: Arc<RwLock<u64>>,
@@ -55,8 +54,7 @@ pub struct Swarm {
 }
 
 // Async task to write pieces to disk and update global have bitfield
-// Remove instrument macro to test Send bound issue
-// #[instrument(skip(piece_receiver, have, piece_length, num_pieces, file_path))]
+#[instrument(skip(piece_receiver, have, piece_length, num_pieces, file_path))]
 async fn disk_writer_loop(
     file_path: String,
     piece_receiver: Receiver<Piece>,
@@ -125,6 +123,7 @@ struct PeerState {
 }
 
 /// Calculates piece rarity across all known peer bitfields.
+/// Result is a vector of (piece_index, count) tuples, sorted by rarity.
 #[instrument(level = "debug", skip(peer_states, num_pieces))]
 fn calculate_rarity(
     peer_states: &HashMap<Peer, PeerState>,
@@ -163,6 +162,9 @@ async fn scheduler_loop(
     num_pieces: usize,
     notify: Arc<Notify>,
 ) {
+    // Track the next block offset to request for each piece index
+    let mut piece_download_progress: HashMap<usize, u32> = HashMap::new();
+
     loop {
         // Wait for a state change notification or a timeout (e.g., 1 second)
         tokio::select! {
@@ -181,8 +183,10 @@ async fn scheduler_loop(
         let rarity = calculate_rarity(&states, num_pieces);
 
         let mut requested_this_cycle = false;
-        for (piece_idx, _count) in rarity {
+        for (piece_idx, _) in rarity {
             if have.get(piece_idx).unwrap_or(true) {
+                // If we have the piece, ensure it's removed from progress tracking
+                piece_download_progress.remove(&piece_idx);
                 continue;
             }
 
@@ -192,14 +196,28 @@ async fn scheduler_loop(
                 .find(|(_p, s)| s.is_unchoked && s.bitfield.get(piece_idx).unwrap_or(false))
             {
                 debug!(peer.ip = %peer.ip, piece_index = piece_idx, "Found candidate peer for piece");
-                // Found a candidate peer, request the first block (for now)
-                let length = piece_length as u32;
-                let block_size = 16384u32;
-                let begin = 0; // TODO: Request blocks sequentially
-                let size = if begin + block_size > length {
-                    length - begin
+
+                let piece_len_u32 = piece_length as u32;
+
+                // Get the next block offset for this piece, default to 0 if not tracked yet
+                let begin = *piece_download_progress.entry(piece_idx).or_insert(0);
+
+                // Check if we already requested all blocks for this piece
+                if begin >= piece_len_u32 {
+                    debug!(
+                        piece_index = piece_idx,
+                        "All blocks already requested, skipping"
+                    );
+                    // We might have received the piece data but `global_have` hasn't updated yet.
+                    // Or we finished requesting, let's try another piece.
+                    continue;
+                }
+
+                // Calculate block size, handling the last potentially smaller block
+                let size = if begin + BLOCK_SIZE as u32 > piece_len_u32 {
+                    piece_len_u32 - begin
                 } else {
-                    block_size
+                    BLOCK_SIZE as u32
                 };
 
                 // Lock the senders map to get the sender
@@ -208,9 +226,23 @@ async fn scheduler_loop(
                     debug!(piece_index = piece_idx, begin, size, peer.ip = %peer.ip, "Sending Request");
                     if let Err(e) = tx.send(SwarmCommand::Request(piece_idx as u32, begin, size)) {
                         error!(error = %e, peer.ip = %peer.ip, "Failed to send Request command");
+                        // If sending fails, maybe don't update progress? Or remove peer? For now, just log.
+                    } else {
+                        // Update progress only if send succeeded
+                        let next_offset = begin + size;
+                        if next_offset >= piece_len_u32 {
+                            info!(piece_index = piece_idx, "Requested last block of piece");
+                            // Mark as complete by setting offset >= piece_len (or remove)
+                            piece_download_progress.insert(piece_idx, next_offset);
+                        } else {
+                            piece_download_progress.insert(piece_idx, next_offset);
+                        }
+
+                        requested_this_cycle = true;
+                        // For simplicity, we still only request one block per peer per cycle.
+                        // A more advanced scheduler could pipeline requests.
+                        break;
                     }
-                    requested_this_cycle = true;
-                    break; // Move to next scheduling cycle after finding one block to request
                 } else {
                     // This error should be rare if the state is consistent
                     error!(peer.ip = %peer.ip, "Scheduler: Could not find sender for peer in shared map!");
@@ -318,23 +350,18 @@ impl Swarm {
         peer_reciever: mpsc::Receiver<PendingPeer>,
         my_id: String,
         torrent_name: String,
-        size: u64,
         piece_length: u64,
         pieces: Arc<Vec<[u8; 20]>>,
         downloaded: Arc<RwLock<u64>>,
         uploaded: Arc<RwLock<u64>>,
     ) -> Self {
-        info!(
-            torrent_name,
-            my_id, size, piece_length, "Creating new Swarm"
-        );
+        info!(torrent_name, my_id, piece_length, "Creating new Swarm");
         Self {
             peer_reciever,
             channel: async_channel::unbounded(),
             peers: HashSet::new(),
             my_id,
             torrent_name,
-            size,
             piece_length,
             pieces,
             downloaded,
