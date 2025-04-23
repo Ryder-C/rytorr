@@ -28,6 +28,8 @@ use crate::{
     peer::{Peer, PeerConnection, BLOCK_SIZE},
 };
 
+use self::handlers::SwarmCommandHandler;
+
 pub(crate) mod handlers; // Declare the handlers submodule and make it crate-visible
 
 const MAX_CONCURRENT_HANDSHAKES: usize = 10;
@@ -45,13 +47,13 @@ pub enum PeerEvent {
 pub struct Swarm {
     peer_reciever: mpsc::Receiver<PendingPeer>,
     channel: (Sender<Piece>, Receiver<Piece>),
-    peers: HashSet<Peer>,
     my_id: String,
     torrent_name: String,
     piece_length: u64,
     pieces: Arc<Vec<[u8; 20]>>,
     downloaded: Arc<RwLock<u64>>,
     uploaded: Arc<RwLock<u64>>,
+    peer_states: Arc<Mutex<HashMap<Peer, PeerState>>>,
     peer_cmd_senders:
         Arc<Mutex<HashMap<Peer, UnboundedSender<Box<dyn handlers::SwarmCommandHandler + Send>>>>>,
     read_file_handle: Option<Arc<Mutex<File>>>,
@@ -532,17 +534,14 @@ impl Swarm {
         Self {
             peer_reciever,
             channel: async_channel::unbounded(),
-            peers: HashSet::new(),
             my_id,
             torrent_name,
             piece_length,
             pieces,
             downloaded,
             uploaded,
-            peer_cmd_senders: Arc::new(Mutex::new(HashMap::<
-                Peer,
-                UnboundedSender<Box<dyn handlers::SwarmCommandHandler + Send>>,
-            >::new())),
+            peer_states: Arc::new(Mutex::new(HashMap::new())),
+            peer_cmd_senders: Arc::new(Mutex::new(HashMap::new())),
             read_file_handle: None,
         }
     }
@@ -590,28 +589,22 @@ impl Swarm {
             }
         }
 
-        // Shared state for peer information
-        let peer_states = Arc::new(Mutex::new(HashMap::<Peer, PeerState>::new()));
-        let peer_states_clone_event = peer_states.clone();
-        let peer_states_clone_scheduler = peer_states.clone();
+        // Get clones of shared state for loops
+        let peer_states_for_event = self.peer_states.clone(); // Pass to event loop
+        let peer_states_for_scheduler = self.peer_states.clone(); // Pass to scheduler
 
-        // Notification mechanism for state changes
         let notify = Arc::new(Notify::new());
         let notify_clone_event = notify.clone();
         let notify_clone_scheduler = notify.clone();
 
-        // Central event channel
-        let (evt_tx, evt_rx): (
-            UnboundedSender<Box<dyn PeerEventHandler + Send>>,
-            UnboundedReceiver<Box<dyn PeerEventHandler + Send>>,
-        ) = unbounded_channel();
+        let (evt_tx, evt_rx) = unbounded_channel::<Box<dyn PeerEventHandler + Send>>();
         let senders_arc = self.peer_cmd_senders.clone();
 
         info!("Spawning event processing task");
         // Spawn event processing task
         tokio::spawn(event_loop(
             evt_rx,
-            peer_states_clone_event,
+            peer_states_for_event,
             have_clone_event,
             notify_clone_event,
         ));
@@ -622,7 +615,7 @@ impl Swarm {
         let progress_clone_scheduler = piece_download_progress.clone();
         let pending_clone_scheduler = pending_requests.clone();
         tokio::spawn(scheduler_loop(
-            peer_states_clone_scheduler,
+            peer_states_for_scheduler,
             have_clone_scheduler,
             senders_arc,
             piece_length_usize,
@@ -655,8 +648,9 @@ impl Swarm {
                 PendingPeer::Incoming(p, _) => p.clone(),
                 PendingPeer::Outgoing(p) => p.clone(),
             };
-            if self.peers.contains(&peer_obj) {
-                debug!(peer.ip = %peer_obj.ip, "Peer already connected");
+            // Check against peer_cmd_senders map instead of self.peers
+            if self.peer_cmd_senders.lock().await.contains_key(&peer_obj) {
+                debug!(peer.ip = %peer_obj.ip, "Peer already connected or being connected");
                 continue;
             }
             info!(peer = ?peer_obj, "Received new potential peer");
@@ -670,11 +664,23 @@ impl Swarm {
             };
             let piece_sender = self.channel.0.clone();
             let (cmd_tx, cmd_rx) = unbounded_channel();
-            // Lock the shared map to insert the new sender
+
+            // Optimistically insert sender BEFORE spawning task
             self.peer_cmd_senders
                 .lock()
                 .await
                 .insert(peer_obj.clone(), cmd_tx);
+
+            // Ensure read_file_handle is available
+            let read_handle = match &self.read_file_handle {
+                Some(handle) => handle.clone(),
+                None => {
+                    error!(peer.ip=%peer_obj.ip, "Cannot connect peer, read file handle is not available.");
+                    // Remove the sender we just added
+                    self.peer_cmd_senders.lock().await.remove(&peer_obj);
+                    continue; // Skip this peer
+                }
+            };
 
             let progress_clone_peer = piece_download_progress.clone();
             let pending_clone_peer = pending_requests.clone();
@@ -687,15 +693,13 @@ impl Swarm {
                 self.piece_length as usize,
                 self.pieces.clone(),
                 self.uploaded.clone(),
-                self.read_file_handle.clone().unwrap(),
+                read_handle,
                 evt_tx.clone(),
                 cmd_rx,
                 progress_clone_peer,
                 pending_clone_peer,
             )
             .await;
-
-            self.peers.insert(peer_obj);
         }
         info!("Swarm start loop finished");
     }
@@ -745,7 +749,7 @@ impl Swarm {
         piece_sender: Sender<Piece>,
         piece_length: usize,
         piece_hashes: Arc<Vec<[u8; 20]>>,
-        uploaded_counter: Arc<RwLock<u64>>,
+        uploaded: Arc<RwLock<u64>>,
         read_file_handle: Arc<Mutex<File>>,
         peer_event_tx: UnboundedSender<Box<dyn PeerEventHandler + Send>>,
         cmd_rx: UnboundedReceiver<Box<dyn handlers::SwarmCommandHandler + Send>>,
@@ -753,26 +757,32 @@ impl Swarm {
         pending_requests: Arc<Mutex<HashMap<(usize, u32), Instant>>>,
     ) {
         let id = self.my_id.clone();
-        let downloaded_counter = self.downloaded.clone(); // Clone the Arc for the new peer
-        let peer_ip_for_task = match &peer {
-            PendingPeer::Outgoing(p) => p.ip.clone(),
-            PendingPeer::Incoming(p, _) => p.ip.clone(),
+        let downloaded_counter = self.downloaded.clone();
+        // --- Clone shared state for the task --- Need peer_states too
+        let peer_cmd_senders_clone = self.peer_cmd_senders.clone();
+        let peer_states_clone = self.peer_states.clone();
+        // --- End Clone ---
+
+        // Clone peer details early in case PeerConnection::new fails
+        let initial_peer_details = match &peer {
+            PendingPeer::Outgoing(p) => p.clone(),
+            PendingPeer::Incoming(p, _) => p.clone(),
         };
-        let peer_ip_for_span = peer_ip_for_task.clone();
+        let peer_ip_for_span = initial_peer_details.ip.clone();
 
         tokio::spawn(
             async move {
-                let peer_ip = peer_ip_for_task;
+                let peer_ip = initial_peer_details.ip.clone();
                 info!(peer.ip = %peer_ip, "Attempting connection");
                 let mut peer_connection = match PeerConnection::new(
-                    peer,
+                    peer, // This moves `peer`
                     id,
                     info_hash,
                     piece_sender,
                     piece_length,
                     piece_hashes,
-                    downloaded_counter,       // Pass the downloaded counter
-                    uploaded_counter.clone(), // Keep cloning this one too
+                    downloaded_counter,
+                    uploaded.clone(),
                     read_file_handle.clone(),
                     peer_event_tx,
                     cmd_rx,
@@ -784,17 +794,48 @@ impl Swarm {
                     Ok(connection) => connection,
                     Err(e) => {
                         warn!(peer.ip = %peer_ip, error = %e, "Failed to establish connection");
+                        // Cleanup the sender we added optimistically
+                        {
+                             let mut senders_map = peer_cmd_senders_clone.lock().await;
+                             if senders_map.remove(&initial_peer_details).is_some() {
+                                 trace!(peer = ?initial_peer_details, "Removed command sender after connection failure.");
+                             } else {
+                                 warn!(peer = ?initial_peer_details, "Command sender not found during cleanup after connection failure.");
+                             }
+                        }
                         return;
                     }
                 };
 
-                info!(peer = ?peer_connection.peer, "Connection established");
+                // Use the peer details from the established connection
+                let peer_details = peer_connection.peer.clone();
+                info!(peer = ?peer_details, "Connection established, starting loop");
 
-                // The connection loop should handle its own logging
                 peer_connection.start().await;
 
-                info!(peer = ?peer_connection.peer, "Connection closed");
-                // TODO: Add logic here to remove peer from peer_states and peer_cmd_senders
+                // --- Cleanup after connection closes ---
+                info!(peer = ?peer_details, "Connection closed. Cleaning up...");
+
+                // Remove command sender
+                {
+                    let mut senders_map = peer_cmd_senders_clone.lock().await;
+                    if senders_map.remove(&peer_details).is_some() {
+                        trace!(peer = ?peer_details, "Removed command sender.");
+                    } else {
+                        warn!(peer = ?peer_details, "Command sender not found during cleanup.");
+                    }
+                }
+
+                // Remove peer state
+                {
+                    let mut states_map = peer_states_clone.lock().await;
+                    if states_map.remove(&peer_details).is_some() {
+                         trace!(peer = ?peer_details, "Removed peer state.");
+                    } else {
+                         warn!(peer = ?peer_details, "Peer state not found during cleanup.");
+                    }
+                }
+                 info!(peer = ?peer_details, "Cleanup finished.");
             }
             .instrument(tracing::info_span!("peer_connection_task", peer.ip = %peer_ip_for_span)),
         );

@@ -105,8 +105,8 @@ impl MessageHandler for HaveHandler {
                 );
             }
         } else {
-            warn!("Received Have before Bitfield");
-            // Can't determine interest without peer bitfield yet
+            debug!("Received Have before Bitfield");
+            // Some clients share their have states slowly, so we can ignore this.
         }
 
         // Send Have event regardless

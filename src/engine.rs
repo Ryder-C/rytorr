@@ -154,7 +154,7 @@ impl TorrentClient {
                         }
                     };
 
-                    debug!(url = %url, ?response, "Received response from tracker");
+                    info!(url = %url, ?response, "Received response from tracker");
 
                     for peer in response.peers {
                         if let Err(e) = sender.send(PendingPeer::Outgoing(peer)).await {
