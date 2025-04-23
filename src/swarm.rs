@@ -25,8 +25,10 @@ use tracing::{debug, error, info, instrument, trace, warn, Instrument};
 use crate::{
     engine::PendingPeer,
     file::Piece,
-    peer::{Peer, PeerConnection, SwarmCommandHandler, BLOCK_SIZE},
+    peer::{Peer, PeerConnection, BLOCK_SIZE},
 };
+
+pub(crate) mod handlers; // Declare the handlers submodule and make it crate-visible
 
 const MAX_CONCURRENT_HANDSHAKES: usize = 10;
 const REQUEST_TIMEOUT: Duration = Duration::from_secs(30);
@@ -51,7 +53,7 @@ pub struct Swarm {
     downloaded: Arc<RwLock<u64>>,
     uploaded: Arc<RwLock<u64>>,
     peer_cmd_senders:
-        Arc<Mutex<HashMap<Peer, UnboundedSender<Box<dyn SwarmCommandHandler + Send>>>>>,
+        Arc<Mutex<HashMap<Peer, UnboundedSender<Box<dyn handlers::SwarmCommandHandler + Send>>>>>,
     read_file_handle: Option<Arc<Mutex<File>>>,
 }
 
@@ -169,7 +171,9 @@ fn calculate_rarity(
 async fn scheduler_loop(
     peer_states: Arc<Mutex<HashMap<Peer, PeerState>>>,
     global_have: Arc<Mutex<BitVec>>,
-    senders: Arc<Mutex<HashMap<Peer, UnboundedSender<Box<dyn SwarmCommandHandler + Send>>>>>,
+    senders: Arc<
+        Mutex<HashMap<Peer, UnboundedSender<Box<dyn handlers::SwarmCommandHandler + Send>>>>,
+    >,
     piece_length: usize,
     num_pieces: usize,
     notify: Arc<Notify>,
@@ -281,11 +285,12 @@ async fn scheduler_loop(
                         };
 
                         // Create the handler struct and box it
-                        let boxed_handler = Box::new(crate::peer::RequestCommandHandler {
-                            piece: piece_idx as u32,
-                            begin: current_begin,
-                            length: current_size,
-                        });
+                        let boxed_handler: Box<dyn handlers::SwarmCommandHandler + Send> =
+                            Box::new(handlers::RequestCommandHandler {
+                                piece: piece_idx as u32,
+                                begin: current_begin,
+                                length: current_size,
+                            });
 
                         debug!(piece_index = piece_idx, begin = current_begin, size = current_size, peer.ip = %peer.ip, "Pipeline: Sending Request");
                         if let Err(e) = tx.send(boxed_handler) {
@@ -485,7 +490,9 @@ async fn event_loop(
 #[instrument(skip_all)]
 async fn broadcast_have_loop(
     mut completed_piece_rx: UnboundedReceiver<usize>,
-    senders: Arc<Mutex<HashMap<Peer, UnboundedSender<Box<dyn SwarmCommandHandler + Send>>>>>,
+    senders: Arc<
+        Mutex<HashMap<Peer, UnboundedSender<Box<dyn handlers::SwarmCommandHandler + Send>>>>,
+    >,
 ) {
     info!("Starting Have broadcast loop");
     while let Some(piece_index) = completed_piece_rx.recv().await {
@@ -495,9 +502,10 @@ async fn broadcast_have_loop(
         );
         let senders_map = senders.lock().await;
         for (peer, tx) in senders_map.iter() {
-            let cmd = Box::new(crate::peer::SendHaveCommand {
-                piece_index: piece_index as u32,
-            });
+            let cmd: Box<dyn handlers::SwarmCommandHandler + Send> =
+                Box::new(handlers::SendHaveCommand {
+                    piece_index: piece_index as u32,
+                });
             if let Err(e) = tx.send(cmd) {
                 error!(error = %e, peer.ip = %peer.ip, piece_index, "Failed to send SendHaveCommand to peer");
                 // Consider removing the peer's sender if send fails repeatedly
@@ -531,7 +539,10 @@ impl Swarm {
             pieces,
             downloaded,
             uploaded,
-            peer_cmd_senders: Arc::new(Mutex::new(HashMap::new())),
+            peer_cmd_senders: Arc::new(Mutex::new(HashMap::<
+                Peer,
+                UnboundedSender<Box<dyn handlers::SwarmCommandHandler + Send>>,
+            >::new())),
             read_file_handle: None,
         }
     }
@@ -737,7 +748,7 @@ impl Swarm {
         uploaded_counter: Arc<RwLock<u64>>,
         read_file_handle: Arc<Mutex<File>>,
         peer_event_tx: UnboundedSender<Box<dyn PeerEventHandler + Send>>,
-        cmd_rx: UnboundedReceiver<Box<dyn SwarmCommandHandler + Send>>,
+        cmd_rx: UnboundedReceiver<Box<dyn handlers::SwarmCommandHandler + Send>>,
         piece_download_progress: Arc<Mutex<HashMap<usize, u32>>>,
         pending_requests: Arc<Mutex<HashMap<(usize, u32), Instant>>>,
     ) {

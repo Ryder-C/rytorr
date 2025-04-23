@@ -1,5 +1,5 @@
 mod handlers;
-mod message;
+pub(crate) mod message;
 
 use std::collections::HashMap;
 use std::time::Instant;
@@ -10,7 +10,6 @@ use crate::file::Piece;
 use crate::swarm::PeerEventHandler;
 use anyhow::{ensure, Context, Result};
 use async_channel::Sender;
-use async_trait::async_trait;
 use bendy::decoding::FromBencode;
 use bit_vec::BitVec;
 use tokio::{
@@ -25,6 +24,7 @@ use tracing::{debug, error, info, trace, warn};
 use crate::peer::handlers::MessageHandler;
 use crate::peer::message::from_bytes_to_handler;
 use crate::peer::message::Message;
+use crate::swarm::handlers::SwarmCommandHandler;
 
 pub const BLOCK_SIZE: usize = 16384;
 
@@ -124,90 +124,6 @@ pub struct PeerConnection {
     read_file_handle: Arc<Mutex<File>>,
     piece_download_progress: Arc<Mutex<HashMap<usize, u32>>>,
     pending_requests: Arc<Mutex<HashMap<(usize, u32), Instant>>>,
-}
-
-// --- Swarm Command Handling ---
-
-#[async_trait]
-pub(super) trait SwarmCommandHandler: Send {
-    async fn handle(&self, connection: &mut PeerConnection);
-}
-
-pub(crate) struct RequestCommandHandler {
-    pub(crate) piece: u32,
-    pub(crate) begin: u32,
-    pub(crate) length: u32,
-}
-
-#[async_trait]
-impl SwarmCommandHandler for RequestCommandHandler {
-    async fn handle(&self, connection: &mut PeerConnection) {
-        debug!(
-            piece_index = self.piece,
-            begin = self.begin,
-            length = self.length,
-            "Handling Request command"
-        );
-        if let Err(e) = connection
-            .send_message(message::Message::Request(
-                self.piece,
-                self.begin,
-                self.length,
-            ))
-            .await
-        {
-            error!(error = %e, "Failed to send Request message");
-            // Consider breaking the loop or notifying swarm of failure
-        }
-    }
-}
-
-/// Command sent from Swarm to a PeerConnection task to send a Have message.
-pub(crate) struct SendHaveCommand {
-    pub(crate) piece_index: u32,
-}
-
-#[async_trait]
-impl SwarmCommandHandler for SendHaveCommand {
-    async fn handle(&self, connection: &mut PeerConnection) {
-        debug!(piece_index = self.piece_index, "Handling SendHave command");
-        if let Err(e) = connection
-            .send_message(message::Message::Have(self.piece_index))
-            .await
-        {
-            error!(error = %e, piece_index = self.piece_index, "Failed to send Have message");
-        }
-    }
-}
-
-/// Command sent from Swarm to a PeerConnection task to choke the peer.
-#[derive(Debug)]
-pub(crate) struct ChokePeerCommand;
-
-#[async_trait]
-impl SwarmCommandHandler for ChokePeerCommand {
-    async fn handle(&self, connection: &mut PeerConnection) {
-        debug!(peer.ip = %connection.peer.ip, "Handling ChokePeer command");
-        if let Err(e) = connection.set_choking().await {
-            error!(error = %e, peer.ip = %connection.peer.ip, "Failed to execute set_choking command");
-            // TODO: Handle error, maybe notify Swarm or disconnect?
-        }
-    }
-}
-
-/// Command sent from Swarm to a PeerConnection task to unchoke the peer.
-#[derive(Debug)]
-pub(crate) struct UnchokePeerCommand;
-
-#[async_trait]
-impl SwarmCommandHandler for UnchokePeerCommand {
-    async fn handle(&self, connection: &mut PeerConnection) {
-        debug!(peer.ip = %connection.peer.ip, "Handling UnchokePeer command");
-        if let Err(e) = connection.set_unchoking().await {
-            error!(error = %e, peer.ip = %connection.peer.ip, "Failed to execute set_unchoking command");
-            // TODO: Handle error
-        }
-    }
 }
 
 // --- PeerConnection Implementation ---
@@ -422,7 +338,7 @@ impl PeerConnection {
     }
 
     #[tracing::instrument(skip(self, message), fields(message_type = std::any::type_name::<message::Message>()))]
-    async fn send_message(&mut self, message: message::Message) -> Result<()> {
+    pub(crate) async fn send_message(&mut self, message: message::Message) -> Result<()> {
         let payload = message.to_be_bytes();
         self.stream.write_all(&payload).await?;
         Ok(())
@@ -522,7 +438,9 @@ impl PeerConnection {
     }
 
     /// Set choking state to true and send Choke message.
-    pub async fn set_choking(&mut self) -> Result<()> {
+    /// Called externally (e.g., by Swarm) based on choking algorithm.
+    // Make crate-visible so SwarmCommandHandler can call it
+    pub(crate) async fn set_choking(&mut self) -> Result<()> {
         if !self.am_choking {
             self.am_choking = true;
             trace!("Choking peer {}", self.peer.ip);
@@ -532,7 +450,9 @@ impl PeerConnection {
     }
 
     /// Set choking state to false and send Unchoke message.
-    pub async fn set_unchoking(&mut self) -> Result<()> {
+    /// Called externally (e.g., by Swarm) based on choking algorithm.
+    // Make crate-visible so SwarmCommandHandler can call it
+    pub(crate) async fn set_unchoking(&mut self) -> Result<()> {
         if self.am_choking {
             self.am_choking = false;
             trace!("Unchoking peer {}", self.peer.ip);
