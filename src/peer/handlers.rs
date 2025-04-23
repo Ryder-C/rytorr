@@ -210,7 +210,7 @@ impl MessageHandler for RequestHandler {
                 }
 
                 // Update upload counter
-                let mut uploaded = connection.uploaded_counter.write().await;
+                let mut uploaded = connection.uploaded.write().await;
                 *uploaded += block_len as u64;
                 trace!(peer.ip = %connection.peer.ip, added = block_len, total_uploaded = *uploaded, "Updated uploaded count");
             }
@@ -331,11 +331,24 @@ impl MessageHandler for PieceHandler {
             let expected_hash = &connection.piece_hashes[piece_index];
 
             if calculated_hash.as_slice() == expected_hash {
+                let piece_len = data.len(); // Get the actual length of the verified piece
                 info!(
                     piece_index,
-                    data_len = data.len(),
+                    data_len = piece_len,
                     "Piece completed and verified"
                 );
+
+                // Increment the global downloaded counter
+                {
+                    let mut downloaded = connection.downloaded.write().await;
+                    *downloaded += piece_len as u64;
+                    trace!(
+                        piece_index,
+                        added = piece_len,
+                        total_downloaded = *downloaded,
+                        "Updated global downloaded count"
+                    );
+                }
 
                 // Update local 'have' bitfield BEFORE sending piece/updating interest
                 let have_bitfield_changed = connection.set_piece_as_completed(piece_index);

@@ -4,9 +4,11 @@ use std::sync::Arc;
 use super::{Trackable, TrackerResponse};
 use anyhow::{bail, Result};
 use bendy::decoding::{FromBencode, Object, ResultExt as _};
+use tracing::{debug, error, info, instrument, trace, warn};
 use urlencoding::encode_binary;
 
 // Tracker parameters from bittorrent spec <https://wiki.theory.org/BitTorrentSpecification#Tracker_HTTP.2FHTTPS_Protocol>
+#[derive(Debug)]
 pub struct Http {
     url: String,
     info_hash: Arc<Vec<u8>>,
@@ -14,13 +16,18 @@ pub struct Http {
     port: u16,
     uploaded: u64,
     downloaded: u64,
+    left: u64,
     size: u64,
     // Compact always 1
-    event: Option<&'static str>,
     tracker_id: Option<String>,
+
+    // State for event reporting
+    started_sent: bool,
+    needs_complete_event: bool,
 }
 
 impl Http {
+    #[instrument(skip(info_hash, peer_id), fields(url = %url, port = port, size = size))]
     pub fn new(
         url: String,
         info_hash: Arc<Vec<u8>>,
@@ -28,8 +35,7 @@ impl Http {
         port: u16,
         size: u64,
     ) -> Self {
-        let event = None; // Some(EVENT_STARTED);
-
+        debug!("Creating new HTTP tracker instance");
         Self {
             url,
             info_hash,
@@ -37,63 +43,130 @@ impl Http {
             port,
             uploaded: 0,
             downloaded: 0,
+            left: size,
             size,
-            event,
             tracker_id: None,
+            started_sent: false,
+            needs_complete_event: false,
         }
     }
 }
 
 impl Trackable for Http {
+    #[instrument(name="http_scrape", skip(self), fields(url = %self.url, tracker_id = ?self.tracker_id))]
     fn scrape(&mut self) -> Result<TrackerResponse> {
-        // URL-encode the info_hash bytes here
+        trace!("Starting HTTP scrape");
+        let event_to_send = if !self.started_sent {
+            Some("started")
+        } else if self.needs_complete_event {
+            Some("completed")
+        } else {
+            None
+        };
+        debug!(event = ?event_to_send, downloaded = self.downloaded, uploaded = self.uploaded, left = self.left, "Determined scrape parameters");
+
         let info_hash_encoded = encode_binary(&self.info_hash).into_owned();
-        // Have to do this to avoid info_hash being double url encoded. Cant find a way to pass in bytes or disable url encoding in ureq.
         let request_url = format!("{}?info_hash={}", &self.url, &info_hash_encoded);
 
-        let mut request = ureq::get(&request_url)
+        let mut request_builder = ureq::get(&request_url)
             .query("peer_id", &self.peer_id)
             .query("port", &self.port.to_string())
             .query("uploaded", &self.uploaded.to_string())
             .query("downloaded", &self.downloaded.to_string())
-            .query("left", &(self.size - self.downloaded).to_string())
+            .query("left", &self.left.to_string())
             .query("compact", "1")
             .query("numwant", &MAX_PEERS.to_string());
 
-        if let Some(event) = self.event {
-            request = request.query("event", event);
-            self.event = None;
+        if let Some(event) = event_to_send {
+            request_builder = request_builder.query("event", event);
         }
 
         if let Some(tracker_id) = &self.tracker_id {
-            request = request.query("trackerid", tracker_id);
+            request_builder = request_builder.query("trackerid", tracker_id);
         }
 
-        let mut bytes = vec![];
-        request.call()?.into_reader().read_to_end(&mut bytes)?;
+        debug!(final_url = %request_builder.url(), "Sending tracker request");
 
-        let response = HttpResponse::from_bencode(&bytes);
-        let response = match response {
-            Ok(resp) => resp,
-            Err(e) => bail!("Invalid Response from Tracker {}", e),
+        let mut response_reader = match request_builder.call() {
+            Ok(resp) => resp.into_reader(),
+            Err(e) => {
+                error!(error = %e, "HTTP tracker request failed");
+                bail!("HTTP tracker request failed: {}", e);
+            }
         };
 
+        let mut bytes = vec![];
+        if let Err(e) = response_reader.read_to_end(&mut bytes) {
+            error!(error = %e, "Failed to read tracker response body");
+            bail!("Failed to read tracker response body: {}", e);
+        }
+        debug!(
+            response_len = bytes.len(),
+            "Received tracker response bytes"
+        );
+
+        let response = match HttpResponse::from_bencode(&bytes) {
+            Ok(resp) => resp,
+            Err(e) => {
+                error!(error = %e, "Failed to parse tracker response Bencode");
+                bail!("Invalid Bencoded Response from Tracker: {}", e);
+            }
+        };
+        trace!(?response, "Parsed tracker response");
+
         if let Some(reason) = &response.failure_reason {
+            error!(failure_reason = %reason, "Tracker reported failure");
             bail!("Tracker Failed: {}", reason)
         }
 
         if let Some(message) = &response.warning_message {
-            println!("Tracker Warning: {}", message);
+            warn!(warning_message = %message, "Tracker Warning");
         }
 
-        self.tracker_id.clone_from(&response.tracker_id);
+        if self.tracker_id != response.tracker_id {
+            debug!(old_tracker_id = ?self.tracker_id, new_tracker_id = ?response.tracker_id, "Updating tracker ID");
+            self.tracker_id = response.tracker_id.clone();
+        } else {
+            trace!("Tracker ID unchanged");
+        }
 
-        response.try_into()
+        if event_to_send.is_some() {
+            if event_to_send == Some("started") {
+                trace!("Marking 'started' event as sent");
+                self.started_sent = true;
+            }
+            if event_to_send == Some("completed") {
+                trace!("Resetting 'needs_complete_event' flag");
+                self.needs_complete_event = false;
+            }
+        }
+
+        match TrackerResponse::try_from(response) {
+            Ok(parsed_resp) => {
+                debug!(
+                    peers_count = parsed_resp.peers.len(),
+                    interval = parsed_resp.interval,
+                    "Scrape successful"
+                );
+                Ok(parsed_resp)
+            }
+            Err(e) => {
+                error!(error = %e, "Failed to convert internal HttpResponse to TrackerResponse");
+                bail!("Failed to process tracker response fields: {}", e)
+            }
+        }
     }
 
-    fn update_progress(&mut self, downloaded: u64, uploaded: u64) {
+    #[instrument(level = "trace", skip(self), fields(url = %self.url))]
+    fn update_progress(&mut self, downloaded: u64, uploaded: u64, left: u64) {
+        if left == 0 && self.left != 0 {
+            debug!("Download completed, scheduling 'completed' event");
+            self.needs_complete_event = true;
+        }
         self.downloaded = downloaded;
         self.uploaded = uploaded;
+        self.left = left;
+        trace!(downloaded, uploaded, left, "Updated tracker progress");
     }
 }
 

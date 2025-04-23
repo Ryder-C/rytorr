@@ -62,7 +62,6 @@ async fn main() {
     }
 
     // --- Initialize Engine ---
-    // TODO: Make port configurable via args/config
     let port = 4444;
     info!(port = port, "Initializing engine");
     let engine = Engine::new(port);

@@ -753,6 +753,7 @@ impl Swarm {
         pending_requests: Arc<Mutex<HashMap<(usize, u32), Instant>>>,
     ) {
         let id = self.my_id.clone();
+        let downloaded_counter = self.downloaded.clone(); // Clone the Arc for the new peer
         let peer_ip_for_task = match &peer {
             PendingPeer::Outgoing(p) => p.ip.clone(),
             PendingPeer::Incoming(p, _) => p.ip.clone(),
@@ -770,7 +771,8 @@ impl Swarm {
                     piece_sender,
                     piece_length,
                     piece_hashes,
-                    uploaded_counter.clone(),
+                    downloaded_counter,       // Pass the downloaded counter
+                    uploaded_counter.clone(), // Keep cloning this one too
                     read_file_handle.clone(),
                     peer_event_tx,
                     cmd_rx,

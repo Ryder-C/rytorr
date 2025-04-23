@@ -140,7 +140,11 @@ impl TorrentClient {
                     };
 
                 loop {
-                    tracker.update_progress(*downloaded.read().await, *uploaded.read().await);
+                    let current_downloaded = *downloaded.read().await;
+                    let current_uploaded = *uploaded.read().await;
+                    let left = size.saturating_sub(current_downloaded);
+                    tracker.update_progress(current_downloaded, current_uploaded, left);
+
                     let response = match tracker.scrape() {
                         Ok(r) => r,
                         Err(e) => {
