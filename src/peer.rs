@@ -2,6 +2,7 @@ mod handlers;
 mod message;
 
 use std::collections::HashMap;
+use std::time::Instant;
 use std::{hash::Hash, net::SocketAddr, sync::Arc};
 
 use crate::engine::PendingPeer;
@@ -16,6 +17,7 @@ use tokio::{
     io::{AsyncReadExt, AsyncWriteExt},
     net::TcpStream,
     sync::mpsc::{UnboundedReceiver, UnboundedSender},
+    sync::Mutex,
 };
 use tracing::{debug, error, info, trace};
 
@@ -114,6 +116,10 @@ pub struct PeerConnection {
 
     event_tx: UnboundedSender<Box<dyn PeerEventHandler + Send>>,
     cmd_rx: UnboundedReceiver<Box<dyn SwarmCommandHandler + Send>>,
+
+    // Shared state from Swarm
+    piece_download_progress: Arc<Mutex<HashMap<usize, u32>>>,
+    pending_requests: Arc<Mutex<HashMap<(usize, u32), Instant>>>,
 }
 
 // --- Swarm Command Handling ---
@@ -166,6 +172,9 @@ impl PeerConnection {
         piece_hashes: Arc<Vec<[u8; 20]>>,
         event_tx: UnboundedSender<Box<dyn PeerEventHandler + Send>>,
         cmd_rx: UnboundedReceiver<Box<dyn SwarmCommandHandler + Send>>,
+        // Add shared state params
+        piece_download_progress: Arc<Mutex<HashMap<usize, u32>>>,
+        pending_requests: Arc<Mutex<HashMap<(usize, u32), Instant>>>,
     ) -> Result<Self> {
         let mut conn = match peer {
             PendingPeer::Outgoing(p) => {
@@ -178,6 +187,8 @@ impl PeerConnection {
                     piece_hashes.clone(),
                     event_tx.clone(),
                     cmd_rx,
+                    piece_download_progress.clone(),
+                    pending_requests.clone(),
                 )
                 .await?
             }
@@ -192,11 +203,14 @@ impl PeerConnection {
                     piece_hashes.clone(),
                     event_tx.clone(),
                     cmd_rx,
+                    piece_download_progress.clone(),
+                    pending_requests.clone(),
                 )
                 .await?
             }
         };
-        conn.pending_pieces = HashMap::new();
+        // This init seems redundant now, should be handled by Swarm
+        // conn.pending_pieces = HashMap::new();
         Ok(conn)
     }
 
@@ -209,6 +223,9 @@ impl PeerConnection {
         piece_hashes: Arc<Vec<[u8; 20]>>,
         event_tx: UnboundedSender<Box<dyn PeerEventHandler + Send>>,
         cmd_rx: UnboundedReceiver<Box<dyn SwarmCommandHandler + Send>>,
+        // Add shared state params
+        piece_download_progress: Arc<Mutex<HashMap<usize, u32>>>,
+        pending_requests: Arc<Mutex<HashMap<(usize, u32), Instant>>>,
     ) -> Result<Self> {
         let mut stream = TcpStream::connect(format!("{}:{}", peer.ip, peer.port))
             .await
@@ -232,6 +249,8 @@ impl PeerConnection {
             peer_interested: false,
             event_tx,
             cmd_rx,
+            piece_download_progress,
+            pending_requests,
         })
     }
 
@@ -245,6 +264,9 @@ impl PeerConnection {
         piece_hashes: Arc<Vec<[u8; 20]>>,
         event_tx: UnboundedSender<Box<dyn PeerEventHandler + Send>>,
         cmd_rx: UnboundedReceiver<Box<dyn SwarmCommandHandler + Send>>,
+        // Add shared state params
+        piece_download_progress: Arc<Mutex<HashMap<usize, u32>>>,
+        pending_requests: Arc<Mutex<HashMap<(usize, u32), Instant>>>,
     ) -> Result<Self> {
         Self::read_handshake(&mut stream, &info_hash).await?;
         Self::write_handshake(&mut stream, &info_hash, &my_id).await?;
@@ -265,6 +287,8 @@ impl PeerConnection {
             peer_interested: false,
             event_tx,
             cmd_rx,
+            piece_download_progress,
+            pending_requests,
         })
     }
 

@@ -159,37 +159,64 @@ pub(super) struct PieceHandler {
 #[async_trait]
 impl MessageHandler for PieceHandler {
     async fn handle(&self, connection: &mut PeerConnection) {
-        let piece_index = self.index;
+        let piece_index = self.index as usize; // Use usize for map keys
         let begin = self.begin;
         let block = self.block.clone(); // Clone data to avoid borrow issues if needed later
+        let block_len = block.len() as u32;
 
-        debug!(
-            piece_index,
-            begin,
-            block_len = block.len(),
-            "Received Piece block"
-        );
+        debug!(piece_index, begin, block_len, "Received Piece block");
+
+        // --- Update Shared State ---
+        let block_key = (piece_index, begin);
+        let removed = {
+            let mut pending_guard = connection.pending_requests.lock().await;
+            pending_guard.remove(&block_key).is_some()
+        };
+        if removed {
+            trace!(piece_index, begin, "Removed block from pending requests");
+        } else {
+            // This might happen if the request timed out just before the block arrived.
+            // Or if we received an unsolicited block.
+            warn!(
+                piece_index,
+                begin, "Received block that was not pending (or timed out)"
+            );
+        }
+
+        let next_expected_begin = begin + block_len;
+        {
+            let mut progress_guard = connection.piece_download_progress.lock().await;
+            // Update progress only if this block moves the progress forward
+            let current_progress = progress_guard.entry(piece_index).or_insert(0);
+            if next_expected_begin > *current_progress {
+                *current_progress = next_expected_begin;
+                trace!(
+                    piece_index,
+                    new_progress = next_expected_begin,
+                    "Updated download progress"
+                );
+            }
+        }
 
         let num_blocks = connection.piece_length.div_ceil(BLOCK_SIZE);
         let blocks = connection
             .pending_pieces
-            .entry(piece_index as usize)
+            .entry(piece_index)
             .or_insert_with(|| vec![None; num_blocks]);
-        let block_index = begin as usize / BLOCK_SIZE;
+        let block_index = (begin as usize) / BLOCK_SIZE;
         if block_index >= blocks.len() {
             error!(
                 piece_index,
-                begin,
-                block_len = block.len(),
-                num_blocks,
-                "Received block with invalid begin offset"
+                begin, block_len, num_blocks, "Received block with invalid begin offset"
             );
             return;
         }
         if blocks[block_index].is_some() {
-            warn!(piece_index, block_index, "Received duplicate block");
-            // Avoid overwriting potentially valid data with duplicate
-            // return; // Or decide if overwriting is okay
+            trace!(
+                piece_index,
+                block_index,
+                "Overwriting existing block data (was duplicate or race?)"
+            );
         }
         // Store the block
         blocks[block_index] = Some(block);
@@ -212,13 +239,13 @@ impl MessageHandler for PieceHandler {
                         "Missing block during assembly after all() check!"
                     );
                     // Clear the entry to force re-request later?
-                    connection.pending_pieces.remove(&(piece_index as usize));
+                    connection.pending_pieces.remove(&{ piece_index });
                     return;
                 }
             }
 
             // Remove the entry now that we've taken the blocks
-            connection.pending_pieces.remove(&(piece_index as usize));
+            connection.pending_pieces.remove(&{ piece_index });
 
             // TODO: Adjust data length if it's the last piece and shorter than piece_length
             // Example: let expected_piece_len = if piece_index as usize == connection.piece_hashes.len() - 1 { ... } else { connection.piece_length };
@@ -228,7 +255,7 @@ impl MessageHandler for PieceHandler {
             let mut hasher = Sha1::new();
             hasher.update(&data);
             let calculated_hash = hasher.finalize();
-            let expected_hash = &connection.piece_hashes[piece_index as usize];
+            let expected_hash = &connection.piece_hashes[piece_index];
 
             if calculated_hash.as_slice() == expected_hash {
                 info!(
@@ -239,7 +266,7 @@ impl MessageHandler for PieceHandler {
                 if let Err(e) = connection
                     .piece_sender
                     .send(Piece {
-                        index: piece_index,
+                        index: piece_index as u32,
                         data,
                     })
                     .await

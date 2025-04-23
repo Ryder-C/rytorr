@@ -2,7 +2,7 @@ use std::{
     cmp::Ordering,
     collections::{HashMap, HashSet},
     sync::Arc,
-    time::Instant,
+    time::{Duration, Instant},
 };
 
 use anyhow::Result;
@@ -17,7 +17,7 @@ use tokio::{
         mpsc::{unbounded_channel, UnboundedReceiver, UnboundedSender},
         Mutex, Notify, OwnedSemaphorePermit, RwLock, Semaphore,
     },
-    time::{sleep, Duration},
+    time::sleep,
 };
 use tracing::{debug, error, info, instrument, trace, warn, Instrument};
 
@@ -28,7 +28,8 @@ use crate::{
 };
 
 const MAX_CONCURRENT_HANDSHAKES: usize = 10;
-const REQUEST_TIMEOUT: Duration = Duration::from_secs(10);
+const REQUEST_TIMEOUT: Duration = Duration::from_secs(30);
+const PIPELINE_DEPTH: usize = 5; // Max blocks to request consecutively from one peer for one piece
 
 #[derive(Debug, Clone)]
 pub enum PeerEvent {
@@ -98,16 +99,16 @@ async fn disk_writer_loop(
             error!(parent: &span, error = %e, offset, "Disk seek failed");
             continue; // Skip this piece if seek fails
         }
+        // Write the piece to disk
         if let Err(e) = file.write_all(&piece.data).instrument(span.clone()).await {
             error!(parent: &span, error = %e, "Disk write failed");
             continue; // Skip this piece if write fails
         }
-        let have_count;
-        {
+        let have_count = {
             let mut h = have.lock().instrument(span.clone()).await;
             h.set(piece.index as usize, true);
-            have_count = h.iter().filter(|b| *b).count();
-        }
+            h.iter().filter(|b| *b).count()
+        };
         span.in_scope(|| {
             info!(
                 have_count = have_count,
@@ -165,12 +166,9 @@ async fn scheduler_loop(
     piece_length: usize,
     num_pieces: usize,
     notify: Arc<Notify>,
+    piece_download_progress: Arc<Mutex<HashMap<usize, u32>>>,
+    pending_requests: Arc<Mutex<HashMap<(usize, u32), Instant>>>,
 ) {
-    // Track the next block offset we expect to receive for each piece index
-    let mut piece_download_progress: HashMap<usize, u32> = HashMap::new();
-    // Track blocks requested but not yet confirmed received
-    let mut pending_requests: HashMap<(usize, u32), Instant> = HashMap::new(); // (piece_idx, begin) -> time
-
     loop {
         // Wait for a state change notification or a timeout (e.g., 1 second)
         tokio::select! {
@@ -180,7 +178,8 @@ async fn scheduler_loop(
 
         // --- Timeout check for pending requests ---
         let now = Instant::now();
-        pending_requests.retain(|(idx, begin), requested_at| {
+        let mut pending_requests_guard = pending_requests.lock().await;
+        pending_requests_guard.retain(|(idx, begin), requested_at| {
             let elapsed = now.duration_since(*requested_at);
             if elapsed > REQUEST_TIMEOUT {
                 warn!(
@@ -194,6 +193,7 @@ async fn scheduler_loop(
                 true // Keep in pending_requests
             }
         });
+        drop(pending_requests_guard);
 
         let states = peer_states.lock().await;
         let have = global_have.lock().await;
@@ -208,64 +208,103 @@ async fn scheduler_loop(
         let mut requested_this_cycle = false;
         for (piece_idx, _) in rarity {
             if have.get(piece_idx).unwrap_or(true) {
-                // If we have the piece, ensure it's removed from progress tracking
-                piece_download_progress.remove(&piece_idx);
+                {
+                    let mut progress_guard = piece_download_progress.lock().await;
+                    progress_guard.remove(&piece_idx);
+                }
+                {
+                    let mut pending_requests_guard = pending_requests.lock().await;
+                    pending_requests_guard.retain(|(p_idx, _), _| *p_idx != piece_idx);
+                }
                 continue;
             }
 
-            // Find an unchoked peer that has this piece
-            if let Some((peer, _state)) = states
-                .iter()
-                .find(|(_p, s)| s.is_unchoked && s.bitfield.get(piece_idx).unwrap_or(false))
-            {
-                debug!(peer.ip = %peer.ip, piece_index = piece_idx, "Found candidate peer for piece");
-
-                let piece_len_u32 = piece_length as u32;
-
-                // Get the next block offset for this piece, default to 0 if not tracked yet
-                let begin = *piece_download_progress.entry(piece_idx).or_insert(0);
-
-                // Check if we already received all blocks for this piece (according to progress)
-                if begin >= piece_len_u32 {
-                    continue;
-                }
-
-                // --- Check if this specific block is already pending ---
-                let block_key = (piece_idx, begin);
-                if let Some(requested_at) = pending_requests.get(&block_key) {
-                    // Already requested and not timed out (timeout check happened above)
-                    trace!(piece_index = piece_idx, block_offset = begin, requested_ago = ?now.duration_since(*requested_at), "Block already pending, skipping");
-                    continue; // Skip this block, try next piece/peer
-                }
-
-                // Calculate block size, handling the last potentially smaller block
-                let size = if begin + BLOCK_SIZE as u32 > piece_len_u32 {
-                    piece_len_u32 - begin
+            // Find a candidate peer synchronously without locking senders
+            let candidate_peer = states.iter().find_map(|(p, s)| {
+                if s.is_unchoked && s.bitfield.get(piece_idx).unwrap_or(false) {
+                    Some(p.clone())
                 } else {
-                    BLOCK_SIZE as u32
+                    None
+                }
+            });
+
+            // If a candidate is found, asynchronously lock senders and get the tx
+            if let Some(peer) = candidate_peer {
+                let tx_option = {
+                    let senders_map = senders.lock().await; // Use async lock here
+                    senders_map.get(&peer).cloned()
                 };
 
-                // Lock the senders map to get the sender
-                let senders_map = senders.lock().await;
-                if let Some(tx) = senders_map.get(peer) {
-                    // Create the handler struct and box it
-                    let boxed_handler = Box::new(crate::peer::RequestCommandHandler {
-                        piece: piece_idx as u32,
-                        begin,
-                        length: size,
-                    });
+                if let Some(tx) = tx_option {
+                    debug!(peer.ip = %peer.ip, piece_index = piece_idx, "Found candidate peer for piece");
 
-                    debug!(piece_index = piece_idx, begin, size, peer.ip = %peer.ip, "Sending Request");
-                    if let Err(e) = tx.send(boxed_handler) {
-                        error!(error = %e, peer.ip = %peer.ip, "Failed to send Request command handler");
-                    } else {
-                        // Add to pending requests
-                        pending_requests.insert(block_key, Instant::now());
-                        requested_this_cycle = true;
-                    }
+                    let piece_len_u32 = piece_length as u32;
+
+                    // --- Start Pipelining Logic ---
+                    let mut current_begin = {
+                        let mut progress_guard = piece_download_progress.lock().await;
+                        *progress_guard.entry(piece_idx).or_insert(0)
+                    };
+                    let mut blocks_requested_for_peer_piece = 0;
+
+                    while blocks_requested_for_peer_piece < PIPELINE_DEPTH {
+                        // Check if we have already received all blocks for this piece
+                        if current_begin >= piece_len_u32 {
+                            trace!(piece_index = piece_idx, "Pipeline: Reached end of piece");
+                            break; // Finished this piece
+                        }
+
+                        // Check if this specific block is already pending
+                        let block_key = (piece_idx, current_begin);
+                        let is_pending = {
+                            let pending_guard = pending_requests.lock().await;
+                            pending_guard.contains_key(&block_key)
+                        };
+
+                        if is_pending {
+                            trace!(piece_index = piece_idx, block_offset = current_begin, "Pipeline: Block already pending, stopping pipeline for this piece/peer");
+                            break; // Stop pipelining for this piece/peer if a block is pending
+                        }
+
+                        // Calculate block size, handling the last potentially smaller block
+                        let current_size = if current_begin + BLOCK_SIZE as u32 > piece_len_u32 {
+                            piece_len_u32 - current_begin
+                        } else {
+                            BLOCK_SIZE as u32
+                        };
+
+                        // Create the handler struct and box it
+                        let boxed_handler = Box::new(crate::peer::RequestCommandHandler {
+                            piece: piece_idx as u32,
+                            begin: current_begin,
+                            length: current_size,
+                        });
+
+                        debug!(piece_index = piece_idx, begin = current_begin, size = current_size, peer.ip = %peer.ip, "Pipeline: Sending Request");
+                        if let Err(e) = tx.send(boxed_handler) {
+                            error!(error = %e, peer.ip = %peer.ip, piece_index = piece_idx, begin = current_begin, "Pipeline: Failed to send Request command handler, stopping pipeline for this peer/piece");
+                            // If send fails, stop trying to pipeline more requests to this peer for this piece now.
+                            break;
+                        } else {
+                            {
+                                let mut pending_guard = pending_requests.lock().await;
+                                pending_guard.insert(block_key, Instant::now());
+                            }
+                            requested_this_cycle = true;
+                            blocks_requested_for_peer_piece += 1;
+
+                            // Prepare for next potential block in pipeline
+                            current_begin += current_size;
+                        }
+                    } // End of while loop for pipelining
+
+                // NOTE: We DO NOT break the outer loop here.
+                // The scheduler can continue to the next piece in the rarity list,
+                // potentially finding work for other peers or even the same peer
+                // if they have other rare pieces.
                 } else {
-                    // This error should be rare if the state is consistent
-                    error!(peer.ip = %peer.ip, "Scheduler: Could not find sender for peer in shared map!");
+                    error!(peer.ip = %peer.ip, piece_index = piece_idx, "Scheduler: Could not find sender for found peer!");
+                    // Consider removing peer from states if sender is missing, as it indicates inconsistency
                 }
             }
         }
@@ -473,6 +512,9 @@ impl Swarm {
         let file_path = format!("{}.download", torrent_name);
         let piece_receiver = self.channel.1.clone();
 
+        let piece_download_progress = Arc::new(Mutex::new(HashMap::<usize, u32>::new()));
+        let pending_requests = Arc::new(Mutex::new(HashMap::<(usize, u32), Instant>::new()));
+
         info!("Spawning disk writer task");
         // Spawn disk writer task, passing the file path
         tokio::spawn(disk_writer_loop(
@@ -512,6 +554,8 @@ impl Swarm {
         info!("Spawning scheduler task");
         // Spawn the scheduler task
         let piece_length_usize = piece_length as usize;
+        let progress_clone_scheduler = piece_download_progress.clone();
+        let pending_clone_scheduler = pending_requests.clone();
         tokio::spawn(scheduler_loop(
             peer_states_clone_scheduler,
             have_clone_scheduler,
@@ -519,6 +563,8 @@ impl Swarm {
             piece_length_usize,
             num_pieces,
             notify_clone_scheduler,
+            progress_clone_scheduler,
+            pending_clone_scheduler,
         ));
 
         let semaphore = Arc::new(Semaphore::new(MAX_CONCURRENT_HANDSHAKES));
@@ -558,6 +604,9 @@ impl Swarm {
                 .await
                 .insert(peer_obj.clone(), cmd_tx);
 
+            let progress_clone_peer = piece_download_progress.clone();
+            let pending_clone_peer = pending_requests.clone();
+
             self.introduce_peer(
                 new_peer,
                 info_hash.clone(),
@@ -567,6 +616,8 @@ impl Swarm {
                 self.pieces.clone(),
                 evt_tx.clone(),
                 cmd_rx,
+                progress_clone_peer,
+                pending_clone_peer,
             )
             .await;
 
@@ -608,7 +659,9 @@ impl Swarm {
         piece_length,
         piece_hashes,
         peer_event_tx,
-        cmd_rx
+        cmd_rx,
+        piece_download_progress,
+        pending_requests
     ))]
     async fn introduce_peer(
         &self,
@@ -620,6 +673,8 @@ impl Swarm {
         piece_hashes: Arc<Vec<[u8; 20]>>,
         peer_event_tx: UnboundedSender<Box<dyn PeerEventHandler + Send>>,
         cmd_rx: UnboundedReceiver<Box<dyn SwarmCommandHandler + Send>>,
+        piece_download_progress: Arc<Mutex<HashMap<usize, u32>>>,
+        pending_requests: Arc<Mutex<HashMap<(usize, u32), Instant>>>,
     ) {
         let id = self.my_id.clone();
         let peer_ip_for_task = match &peer {
@@ -641,6 +696,8 @@ impl Swarm {
                     piece_hashes,
                     peer_event_tx,
                     cmd_rx,
+                    piece_download_progress,
+                    pending_requests,
                 )
                 .await
                 {
