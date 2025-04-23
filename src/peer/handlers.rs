@@ -1,6 +1,6 @@
 use crate::{
     file::Piece,
-    peer::{PeerConnection, BLOCK_SIZE},
+    peer::{message, PeerConnection, BLOCK_SIZE},
     swarm::{
         BitfieldEventHandler, ChokeEventHandler, HaveEventHandler, PeerEventHandler,
         UnchokeEventHandler,
@@ -9,6 +9,7 @@ use crate::{
 use async_trait::async_trait;
 use bit_vec::BitVec;
 use sha1::{Digest, Sha1};
+use tokio::io::{AsyncReadExt, AsyncSeekExt, SeekFrom};
 use tracing::{debug, error, info, trace, warn};
 
 // Define the trait that all message handlers will implement.
@@ -129,7 +130,6 @@ impl MessageHandler for BitfieldHandler {
 }
 
 pub(super) struct RequestHandler {
-    // Made fields public
     pub index: u32,
     pub begin: u32,
     pub length: u32,
@@ -137,15 +137,61 @@ pub(super) struct RequestHandler {
 
 #[async_trait]
 impl MessageHandler for RequestHandler {
-    async fn handle(&self, _connection: &mut PeerConnection) {
+    async fn handle(&self, connection: &mut PeerConnection) {
         debug!(
+            peer.ip = %connection.peer.ip,
             piece_index = self.index,
             begin = self.begin,
             len = self.length,
             "Received Request"
         );
-        // TODO: Implement logic to read from file and send Piece message
-        warn!("Piece request handling not implemented");
+
+        // Validation
+        if connection.am_choking {
+            trace!(peer.ip = %connection.peer.ip, "Ignoring request: We are choking peer");
+            return;
+        }
+
+        if self.length as usize > BLOCK_SIZE {
+            warn!(peer.ip = %connection.peer.ip, requested_len = self.length, max_len = BLOCK_SIZE, "Ignoring request: Length too large");
+            return;
+        }
+        // TODO: Add validation for index and begin against piece_length and num_pieces
+
+        let block_len = self.length as usize;
+        let mut block_data = vec![0u8; block_len];
+        let offset = self.index as u64 * connection.piece_length as u64 + self.begin as u64;
+
+        // Lock file, seek, and read
+        let mut file_guard = connection.read_file_handle.lock().await;
+        if let Err(e) = file_guard.seek(SeekFrom::Start(offset)).await {
+            error!(error = %e, peer.ip = %connection.peer.ip, offset, "Failed to seek in file for request");
+            return; // Cannot fulfill request
+        }
+        match file_guard.read_exact(&mut block_data).await {
+            Ok(_) => {
+                trace!(peer.ip = %connection.peer.ip, offset, len = block_len, "Read block from file successfully");
+                // Drop the lock before potentially long-running send
+                drop(file_guard);
+
+                // Construct and send Piece message
+                let piece_msg = message::Message::Piece(self.index, self.begin, block_data);
+                if let Err(e) = connection.send_message(piece_msg).await {
+                    error!(error = %e, peer.ip = %connection.peer.ip, "Failed to send Piece message");
+                    // Connection might be dead
+                    return;
+                }
+
+                // Update upload counter
+                let mut uploaded = connection.uploaded_counter.write().await;
+                *uploaded += block_len as u64;
+                trace!(peer.ip = %connection.peer.ip, added = block_len, total_uploaded = *uploaded, "Updated uploaded count");
+            }
+            Err(e) => {
+                error!(error = %e, peer.ip = %connection.peer.ip, offset, len = block_len, "Failed to read block from file for request");
+                // Don't send anything if read failed
+            }
+        }
     }
 }
 
@@ -263,6 +309,28 @@ impl MessageHandler for PieceHandler {
                     data_len = data.len(),
                     "Piece completed and verified"
                 );
+
+                // Update local 'have' bitfield immediately
+                let piece_index_usize = piece_index as usize;
+                if let Some(have_bf) = connection.have_bitfield.as_mut() {
+                    if piece_index_usize < have_bf.len() {
+                        have_bf.set(piece_index_usize, true);
+                        trace!(piece_index, "Updated local have_bitfield");
+                    } else {
+                        warn!(
+                            piece_index,
+                            bitfield_len = have_bf.len(),
+                            "Attempted to set bitfield index out of bounds"
+                        );
+                    }
+                } else {
+                    warn!(
+                        piece_index,
+                        "Have bitfield not initialized when trying to set piece as complete"
+                    );
+                }
+
+                // Send piece to disk writer channel
                 if let Err(e) = connection
                     .piece_sender
                     .send(Piece {
@@ -273,9 +341,8 @@ impl MessageHandler for PieceHandler {
                 {
                     error!(error = %e, piece_index, "Failed to send completed piece to channel");
                 }
-                // TODO: Send Have message? Update local bitfield?
-                // Example: connection.send_message(message::Message::Have(piece_index)).await;
-                // if let Some(have_bf) = connection.have_bitfield.as_mut() { have_bf.set(piece_index as usize, true); }
+                // Note: We no longer send Have message directly from here.
+                // The disk_writer_loop will notify the broadcast_have_loop via channel.
             } else {
                 error!(piece_index, expected_hash = ?expected_hash, calculated_hash = ?calculated_hash.as_slice(), "Piece failed hash check!");
                 // Piece data is already removed from pending_pieces.

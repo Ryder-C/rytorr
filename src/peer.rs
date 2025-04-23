@@ -14,10 +14,11 @@ use async_trait::async_trait;
 use bendy::decoding::FromBencode;
 use bit_vec::BitVec;
 use tokio::{
+    fs::File,
     io::{AsyncReadExt, AsyncWriteExt},
     net::TcpStream,
     sync::mpsc::{UnboundedReceiver, UnboundedSender},
-    sync::Mutex,
+    sync::{Mutex, RwLock},
 };
 use tracing::{debug, error, info, trace};
 
@@ -118,6 +119,8 @@ pub struct PeerConnection {
     cmd_rx: UnboundedReceiver<Box<dyn SwarmCommandHandler + Send>>,
 
     // Shared state from Swarm
+    uploaded_counter: Arc<RwLock<u64>>,
+    read_file_handle: Arc<Mutex<File>>,
     piece_download_progress: Arc<Mutex<HashMap<usize, u32>>>,
     pending_requests: Arc<Mutex<HashMap<(usize, u32), Instant>>>,
 }
@@ -158,6 +161,24 @@ impl SwarmCommandHandler for RequestCommandHandler {
     }
 }
 
+/// Command sent from Swarm to a PeerConnection task to send a Have message.
+pub(crate) struct SendHaveCommand {
+    pub(crate) piece_index: u32,
+}
+
+#[async_trait]
+impl SwarmCommandHandler for SendHaveCommand {
+    async fn handle(&self, connection: &mut PeerConnection) {
+        debug!(piece_index = self.piece_index, "Handling SendHave command");
+        if let Err(e) = connection
+            .send_message(message::Message::Have(self.piece_index))
+            .await
+        {
+            error!(error = %e, piece_index = self.piece_index, "Failed to send Have message");
+        }
+    }
+}
+
 // --- PeerConnection Implementation ---
 
 impl PeerConnection {
@@ -170,13 +191,14 @@ impl PeerConnection {
         piece_sender: Sender<Piece>,
         piece_length: usize,
         piece_hashes: Arc<Vec<[u8; 20]>>,
+        uploaded_counter: Arc<RwLock<u64>>,
+        read_file_handle: Arc<Mutex<File>>,
         event_tx: UnboundedSender<Box<dyn PeerEventHandler + Send>>,
         cmd_rx: UnboundedReceiver<Box<dyn SwarmCommandHandler + Send>>,
-        // Add shared state params
         piece_download_progress: Arc<Mutex<HashMap<usize, u32>>>,
         pending_requests: Arc<Mutex<HashMap<(usize, u32), Instant>>>,
     ) -> Result<Self> {
-        let mut conn = match peer {
+        let conn = match peer {
             PendingPeer::Outgoing(p) => {
                 Self::new_outgoing(
                     p,
@@ -185,6 +207,8 @@ impl PeerConnection {
                     piece_sender.clone(),
                     piece_length,
                     piece_hashes.clone(),
+                    uploaded_counter.clone(),
+                    read_file_handle.clone(),
                     event_tx.clone(),
                     cmd_rx,
                     piece_download_progress.clone(),
@@ -201,6 +225,8 @@ impl PeerConnection {
                     piece_sender.clone(),
                     piece_length,
                     piece_hashes.clone(),
+                    uploaded_counter.clone(),
+                    read_file_handle.clone(),
                     event_tx.clone(),
                     cmd_rx,
                     piece_download_progress.clone(),
@@ -221,9 +247,10 @@ impl PeerConnection {
         piece_sender: Sender<Piece>,
         piece_length: usize,
         piece_hashes: Arc<Vec<[u8; 20]>>,
+        uploaded_counter: Arc<RwLock<u64>>,
+        read_file_handle: Arc<Mutex<File>>,
         event_tx: UnboundedSender<Box<dyn PeerEventHandler + Send>>,
         cmd_rx: UnboundedReceiver<Box<dyn SwarmCommandHandler + Send>>,
-        // Add shared state params
         piece_download_progress: Arc<Mutex<HashMap<usize, u32>>>,
         pending_requests: Arc<Mutex<HashMap<(usize, u32), Instant>>>,
     ) -> Result<Self> {
@@ -249,6 +276,8 @@ impl PeerConnection {
             peer_interested: false,
             event_tx,
             cmd_rx,
+            uploaded_counter,
+            read_file_handle,
             piece_download_progress,
             pending_requests,
         })
@@ -262,9 +291,10 @@ impl PeerConnection {
         piece_sender: Sender<Piece>,
         piece_length: usize,
         piece_hashes: Arc<Vec<[u8; 20]>>,
+        uploaded_counter: Arc<RwLock<u64>>,
+        read_file_handle: Arc<Mutex<File>>,
         event_tx: UnboundedSender<Box<dyn PeerEventHandler + Send>>,
         cmd_rx: UnboundedReceiver<Box<dyn SwarmCommandHandler + Send>>,
-        // Add shared state params
         piece_download_progress: Arc<Mutex<HashMap<usize, u32>>>,
         pending_requests: Arc<Mutex<HashMap<(usize, u32), Instant>>>,
     ) -> Result<Self> {
@@ -287,6 +317,8 @@ impl PeerConnection {
             peer_interested: false,
             event_tx,
             cmd_rx,
+            uploaded_counter,
+            read_file_handle,
             piece_download_progress,
             pending_requests,
         })

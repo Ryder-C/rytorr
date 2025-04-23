@@ -10,7 +10,8 @@ use async_channel::{Receiver, Sender};
 use async_trait::async_trait;
 use bit_vec::BitVec;
 use tokio::{
-    fs::OpenOptions,
+    fs::{File, OpenOptions},
+    io::{AsyncSeekExt, AsyncWriteExt, SeekFrom},
     net::TcpListener,
     sync::{
         mpsc,
@@ -56,16 +57,25 @@ pub struct Swarm {
     uploaded: Arc<RwLock<u64>>,
     peer_cmd_senders:
         Arc<Mutex<HashMap<Peer, UnboundedSender<Box<dyn SwarmCommandHandler + Send>>>>>,
+    read_file_handle: Option<Arc<Mutex<File>>>,
 }
 
 // Async task to write pieces to disk and update global have bitfield
-#[instrument(skip(piece_receiver, have, piece_length, num_pieces, file_path))]
+#[instrument(skip(
+    piece_receiver,
+    have,
+    piece_length,
+    num_pieces,
+    file_path,
+    completed_tx
+))]
 async fn disk_writer_loop(
     file_path: String,
     piece_receiver: Receiver<Piece>,
     have: Arc<Mutex<BitVec>>,
     piece_length: u64,
     num_pieces: usize,
+    completed_tx: UnboundedSender<usize>,
 ) {
     let mut file = match OpenOptions::new()
         .create(true)
@@ -81,7 +91,6 @@ async fn disk_writer_loop(
         }
     };
 
-    use tokio::io::{AsyncSeekExt, AsyncWriteExt, SeekFrom};
     while let Ok(piece) = piece_receiver.recv().await {
         let span = tracing::info_span!("disk_write", piece_index = piece.index);
 
@@ -116,6 +125,9 @@ async fn disk_writer_loop(
                 "Piece written to disk"
             );
         });
+        if let Err(e) = completed_tx.send(piece.index as usize) {
+            error!(error = %e, piece_index = piece.index, "Failed to send completed piece notification");
+        }
     }
     info!("Disk writer loop finished");
 }
@@ -474,6 +486,34 @@ async fn event_loop(
     info!("Event loop finished");
 }
 
+// Task to broadcast Have messages for completed pieces
+#[instrument(skip_all)]
+async fn broadcast_have_loop(
+    mut completed_piece_rx: UnboundedReceiver<usize>,
+    senders: Arc<Mutex<HashMap<Peer, UnboundedSender<Box<dyn SwarmCommandHandler + Send>>>>>,
+) {
+    info!("Starting Have broadcast loop");
+    while let Some(piece_index) = completed_piece_rx.recv().await {
+        debug!(
+            piece_index,
+            "Received completed piece notification for broadcast"
+        );
+        let senders_map = senders.lock().await;
+        for (peer, tx) in senders_map.iter() {
+            let cmd = Box::new(crate::peer::SendHaveCommand {
+                piece_index: piece_index as u32,
+            });
+            if let Err(e) = tx.send(cmd) {
+                error!(error = %e, peer.ip = %peer.ip, piece_index, "Failed to send SendHaveCommand to peer");
+                // Consider removing the peer's sender if send fails repeatedly
+            } else {
+                trace!(peer.ip = %peer.ip, piece_index, "Sent SendHaveCommand");
+            }
+        }
+    }
+    error!("Have broadcast loop exited unexpectedly");
+}
+
 impl Swarm {
     #[instrument(skip(peer_reciever, pieces, downloaded, uploaded))]
     pub fn new(
@@ -497,6 +537,7 @@ impl Swarm {
             downloaded,
             uploaded,
             peer_cmd_senders: Arc::new(Mutex::new(HashMap::new())),
+            read_file_handle: None,
         }
     }
 
@@ -512,18 +553,36 @@ impl Swarm {
         let file_path = format!("{}.download", torrent_name);
         let piece_receiver = self.channel.1.clone();
 
+        let (completed_piece_tx, completed_piece_rx) = unbounded_channel::<usize>();
+
         let piece_download_progress = Arc::new(Mutex::new(HashMap::<usize, u32>::new()));
         let pending_requests = Arc::new(Mutex::new(HashMap::<(usize, u32), Instant>::new()));
 
         info!("Spawning disk writer task");
-        // Spawn disk writer task, passing the file path
+        // Spawn disk writer task, passing the file path and completed piece sender
         tokio::spawn(disk_writer_loop(
             file_path.clone(),
             piece_receiver,
             have_clone_disk,
             piece_length,
             num_pieces,
+            completed_piece_tx,
         ));
+
+        // Open file for reading AFTER ensuring disk_writer has potentially created/truncated it
+        // Give a small delay to increase likelihood file exists, although ideally we'd sync better.
+        sleep(Duration::from_millis(100)).await;
+        match File::open(&file_path).await {
+            Ok(file) => {
+                info!(path = %file_path, "Opened download file for reading by peers");
+                self.read_file_handle = Some(Arc::new(Mutex::new(file)));
+            }
+            Err(e) => {
+                error!(path = %file_path, error = %e, "Failed to open download file for reading, uploads will fail.");
+                // Swarm can continue, but uploads won't work until file is accessible.
+                self.read_file_handle = None;
+            }
+        }
 
         // Shared state for peer information
         let peer_states = Arc::new(Mutex::new(HashMap::<Peer, PeerState>::new()));
@@ -565,6 +624,13 @@ impl Swarm {
             notify_clone_scheduler,
             progress_clone_scheduler,
             pending_clone_scheduler,
+        ));
+
+        info!("Spawning Have broadcast task");
+        let senders_clone_broadcast = self.peer_cmd_senders.clone();
+        tokio::spawn(broadcast_have_loop(
+            completed_piece_rx,
+            senders_clone_broadcast,
         ));
 
         let semaphore = Arc::new(Semaphore::new(MAX_CONCURRENT_HANDSHAKES));
@@ -614,6 +680,8 @@ impl Swarm {
                 piece_sender,
                 self.piece_length as usize,
                 self.pieces.clone(),
+                self.uploaded.clone(),
+                self.read_file_handle.clone().unwrap(),
                 evt_tx.clone(),
                 cmd_rx,
                 progress_clone_peer,
@@ -671,6 +739,8 @@ impl Swarm {
         piece_sender: Sender<Piece>,
         piece_length: usize,
         piece_hashes: Arc<Vec<[u8; 20]>>,
+        uploaded_counter: Arc<RwLock<u64>>,
+        read_file_handle: Arc<Mutex<File>>,
         peer_event_tx: UnboundedSender<Box<dyn PeerEventHandler + Send>>,
         cmd_rx: UnboundedReceiver<Box<dyn SwarmCommandHandler + Send>>,
         piece_download_progress: Arc<Mutex<HashMap<usize, u32>>>,
@@ -694,6 +764,8 @@ impl Swarm {
                     piece_sender,
                     piece_length,
                     piece_hashes,
+                    uploaded_counter.clone(),
+                    read_file_handle.clone(),
                     peer_event_tx,
                     cmd_rx,
                     piece_download_progress,
