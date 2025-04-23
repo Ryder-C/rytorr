@@ -6,6 +6,7 @@ use crate::{
         UnchokeEventHandler,
     },
 };
+use anyhow::Result;
 use async_trait::async_trait;
 use bit_vec::BitVec;
 use sha1::{Digest, Sha1};
@@ -88,9 +89,14 @@ impl MessageHandler for HaveHandler {
     async fn handle(&self, connection: &mut PeerConnection) {
         let idx = self.0;
         debug!(piece_index = idx, "Received Have");
+        let mut interest_needs_update = false; // Flag to check if interest state might change
         if let Some(ref mut bf) = connection.peer_bitfield {
             if idx < bf.len() as u32 {
-                bf.set(idx as usize, true);
+                // Only update interest if the bit wasn't already set
+                if !bf.get(idx as usize).unwrap_or(false) {
+                    bf.set(idx as usize, true);
+                    interest_needs_update = true;
+                }
             } else {
                 warn!(
                     piece_index = idx,
@@ -100,32 +106,53 @@ impl MessageHandler for HaveHandler {
             }
         } else {
             warn!("Received Have before Bitfield");
+            // Can't determine interest without peer bitfield yet
         }
+
+        // Send Have event regardless
         let handler: Box<dyn PeerEventHandler + Send> = Box::new(HaveEventHandler {
             peer: connection.peer.clone(),
             idx: idx as usize,
         });
         let _ = connection.event_tx.send(handler);
+
+        // Update interest state if the peer's bitfield changed
+        if interest_needs_update {
+            if let Err(e) = connection.update_interest_state().await {
+                error!(error = %e, peer.ip = %connection.peer.ip, "Failed to update interest state after Have");
+                // Handle error appropriately, maybe mark connection as failed?
+            }
+        }
     }
 }
 
-pub(super) struct BitfieldHandler(pub BitVec); // Made field public
+pub(super) struct BitfieldHandler(pub BitVec);
 
 #[async_trait]
 impl MessageHandler for BitfieldHandler {
     async fn handle(&self, connection: &mut PeerConnection) {
         let bf = self.0.clone(); // Clone to avoid borrowing issues
         debug!(bitfield_len = bf.len(), "Received Bitfield");
+
         if connection.peer_bitfield.is_some() {
+            // Check if this is the first bitfield
             warn!("Received Bitfield message twice");
         }
         // TODO: Verify bitfield length against number of pieces from torrent info
         connection.peer_bitfield = Some(bf.clone());
+
+        // Send Bitfield event
         let handler: Box<dyn PeerEventHandler + Send> = Box::new(BitfieldEventHandler {
             peer: connection.peer.clone(),
             bf,
         });
         let _ = connection.event_tx.send(handler);
+
+        // Always update interest state after receiving a bitfield
+        if let Err(e) = connection.update_interest_state().await {
+            error!(error = %e, peer.ip = %connection.peer.ip, "Failed to update interest state after Bitfield");
+            // Handle error
+        }
     }
 }
 
@@ -166,7 +193,7 @@ impl MessageHandler for RequestHandler {
         let mut file_guard = connection.read_file_handle.lock().await;
         if let Err(e) = file_guard.seek(SeekFrom::Start(offset)).await {
             error!(error = %e, peer.ip = %connection.peer.ip, offset, "Failed to seek in file for request");
-            return; // Cannot fulfill request
+            return;
         }
         match file_guard.read_exact(&mut block_data).await {
             Ok(_) => {
@@ -310,24 +337,16 @@ impl MessageHandler for PieceHandler {
                     "Piece completed and verified"
                 );
 
-                // Update local 'have' bitfield immediately
-                let piece_index_usize = piece_index as usize;
-                if let Some(have_bf) = connection.have_bitfield.as_mut() {
-                    if piece_index_usize < have_bf.len() {
-                        have_bf.set(piece_index_usize, true);
-                        trace!(piece_index, "Updated local have_bitfield");
-                    } else {
-                        warn!(
-                            piece_index,
-                            bitfield_len = have_bf.len(),
-                            "Attempted to set bitfield index out of bounds"
-                        );
+                // Update local 'have' bitfield BEFORE sending piece/updating interest
+                let have_bitfield_changed = connection.set_piece_as_completed(piece_index);
+
+                // Update interest state IF our 'have' status changed for this piece
+                // (We might now be not interested if this was the last piece we needed from this peer)
+                if have_bitfield_changed {
+                    if let Err(e) = connection.update_interest_state().await {
+                        error!(error = %e, peer.ip = %connection.peer.ip, "Failed to update interest state after piece completion");
+                        // Potentially recoverable error, continue to send piece
                     }
-                } else {
-                    warn!(
-                        piece_index,
-                        "Have bitfield not initialized when trying to set piece as complete"
-                    );
                 }
 
                 // Send piece to disk writer channel
@@ -340,9 +359,12 @@ impl MessageHandler for PieceHandler {
                     .await
                 {
                     error!(error = %e, piece_index, "Failed to send completed piece to channel");
+                    // If we failed to send, should we revert the have_bitfield update? Probably not needed.
+                    // Should we retry sending? Depends on channel setup.
+                } else {
+                    trace!(piece_index, "Sent completed piece to disk writer");
                 }
-                // Note: We no longer send Have message directly from here.
-                // The disk_writer_loop will notify the broadcast_have_loop via channel.
+                // Note: Have message is no longer sent from here.
             } else {
                 error!(piece_index, expected_hash = ?expected_hash, calculated_hash = ?calculated_hash.as_slice(), "Piece failed hash check!");
                 // Piece data is already removed from pending_pieces.

@@ -40,11 +40,6 @@ pub enum PeerEvent {
     Choke(Peer),
 }
 
-#[derive(Debug, Clone)]
-pub enum SwarmCommand {
-    Request(u32, u32, u32),
-}
-
 pub struct Swarm {
     peer_reciever: mpsc::Receiver<PendingPeer>,
     channel: (Sender<Piece>, Receiver<Piece>),

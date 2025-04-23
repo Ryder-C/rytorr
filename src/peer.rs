@@ -20,10 +20,11 @@ use tokio::{
     sync::mpsc::{UnboundedReceiver, UnboundedSender},
     sync::{Mutex, RwLock},
 };
-use tracing::{debug, error, info, trace};
+use tracing::{debug, error, info, trace, warn};
 
 use crate::peer::handlers::MessageHandler;
 use crate::peer::message::from_bytes_to_handler;
+use crate::peer::message::Message;
 
 pub const BLOCK_SIZE: usize = 16384;
 
@@ -179,8 +180,37 @@ impl SwarmCommandHandler for SendHaveCommand {
     }
 }
 
-// --- PeerConnection Implementation ---
+/// Command sent from Swarm to a PeerConnection task to choke the peer.
+#[derive(Debug)]
+pub(crate) struct ChokePeerCommand;
 
+#[async_trait]
+impl SwarmCommandHandler for ChokePeerCommand {
+    async fn handle(&self, connection: &mut PeerConnection) {
+        debug!(peer.ip = %connection.peer.ip, "Handling ChokePeer command");
+        if let Err(e) = connection.set_choking().await {
+            error!(error = %e, peer.ip = %connection.peer.ip, "Failed to execute set_choking command");
+            // TODO: Handle error, maybe notify Swarm or disconnect?
+        }
+    }
+}
+
+/// Command sent from Swarm to a PeerConnection task to unchoke the peer.
+#[derive(Debug)]
+pub(crate) struct UnchokePeerCommand;
+
+#[async_trait]
+impl SwarmCommandHandler for UnchokePeerCommand {
+    async fn handle(&self, connection: &mut PeerConnection) {
+        debug!(peer.ip = %connection.peer.ip, "Handling UnchokePeer command");
+        if let Err(e) = connection.set_unchoking().await {
+            error!(error = %e, peer.ip = %connection.peer.ip, "Failed to execute set_unchoking command");
+            // TODO: Handle error
+        }
+    }
+}
+
+// --- PeerConnection Implementation ---
 impl PeerConnection {
     const PSTR: &'static str = "BitTorrent protocol";
 
@@ -439,6 +469,103 @@ impl PeerConnection {
         );
 
         Ok(())
+    }
+
+    /// Determines if we should be interested in the peer based on their bitfield and ours.
+    fn should_i_be_interested(&self) -> bool {
+        match (&self.have_bitfield, &self.peer_bitfield) {
+            (Some(have_bf), Some(peer_bf)) => {
+                // Ensure bitfields are comparable
+                if have_bf.len() != peer_bf.len() {
+                    warn!(
+                        my_len = have_bf.len(),
+                        peer_len = peer_bf.len(),
+                        "Bitfield length mismatch, cannot determine interest accurately."
+                    );
+                    // Default to not interested if lengths mismatch, or handle as error?
+                    return false;
+                }
+
+                // Iterate through pieces. Are we interested if the peer HAS a piece we DON'T HAVE?
+                for i in 0..have_bf.len() {
+                    if peer_bf.get(i).unwrap_or(false) && !have_bf.get(i).unwrap_or(false) {
+                        // Peer has piece 'i', we do not. We are interested.
+                        return true;
+                    }
+                }
+                // If loop completes, peer has no pieces we need.
+                false
+            }
+            _ => {
+                // If either bitfield is missing, we can't determine interest.
+                trace!("Cannot determine interest: one or both bitfields missing.");
+                false
+            }
+        }
+    }
+
+    /// Checks interest state and sends Interested or NotInterested message if it changed.
+    async fn update_interest_state(&mut self) -> Result<()> {
+        let should_be_interested = self.should_i_be_interested();
+
+        if !self.am_interested && should_be_interested {
+            self.am_interested = true;
+            trace!("Becoming interested in peer {}", self.peer.ip);
+            self.send_message(Message::Interested).await?;
+        } else if self.am_interested && !should_be_interested {
+            self.am_interested = false;
+            trace!("Becoming not interested in peer {}", self.peer.ip);
+            self.send_message(Message::NotInterested).await?;
+        }
+        // No change needed if state matches calculation
+        Ok(())
+    }
+
+    /// Set choking state to true and send Choke message.
+    pub async fn set_choking(&mut self) -> Result<()> {
+        if !self.am_choking {
+            self.am_choking = true;
+            trace!("Choking peer {}", self.peer.ip);
+            self.send_message(Message::Choke).await?;
+        }
+        Ok(())
+    }
+
+    /// Set choking state to false and send Unchoke message.
+    pub async fn set_unchoking(&mut self) -> Result<()> {
+        if self.am_choking {
+            self.am_choking = false;
+            trace!("Unchoking peer {}", self.peer.ip);
+            self.send_message(Message::Unchoke).await?;
+        }
+        Ok(())
+    }
+
+    /// Updates the local `have_bitfield`. This should be called AFTER a piece is verified.
+    /// Returns true if the bitfield was actually changed.
+    pub fn set_piece_as_completed(&mut self, piece_index: usize) -> bool {
+        if let Some(have_bf) = self.have_bitfield.as_mut() {
+            if piece_index < have_bf.len() {
+                if !have_bf.get(piece_index).unwrap_or(false) {
+                    // Check if already set
+                    have_bf.set(piece_index, true);
+                    trace!(piece_index, "Updated local have_bitfield");
+                    return true; // State changed
+                }
+            } else {
+                warn!(
+                    piece_index,
+                    bitfield_len = have_bf.len(),
+                    "Attempted to set bitfield index out of bounds in set_piece_as_completed"
+                );
+            }
+        } else {
+            warn!(
+                piece_index,
+                "Have bitfield not initialized when trying to set piece as complete"
+            );
+        }
+        false // State did not change
     }
 }
 
