@@ -201,7 +201,7 @@ async fn scheduler_loop(
         pending_requests_guard.retain(|(idx, begin), requested_at| {
             let elapsed = now.duration_since(*requested_at);
             if elapsed > REQUEST_TIMEOUT {
-                warn!(
+                debug!(
                     piece_index = idx,
                     block_offset = begin,
                     timeout_secs = REQUEST_TIMEOUT.as_secs(),
