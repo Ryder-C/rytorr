@@ -9,12 +9,12 @@ https://github.com/Ryder-C/rytorr)
 
 ## Features
 
-* Parsing of .torrent files
-* Communication with trackers (HTTP and UDP)
-* Peer-to-peer communication (TCP)
-* Implementation of core BitTorrent protocol messages (handshake, bitfield, have, piece, request, etc.)
-* Downloading and saving torrent data to disk
-* Basic swarm management (peer connections, choking/unchoking)
+* [x] Parsing of .torrent files
+* [x] Communication with trackers (HTTP and UDP)
+* [x] Peer-to-peer communication (TCP)
+* [x] Implementation of core BitTorrent protocol messages (handshake, bitfield, have, piece, request, etc.)
+* [x] Downloading and saving torrent data to disk
+* [x] Basic swarm management (peer connections, choking/unchoking)
 
 ## Planned Features
 
