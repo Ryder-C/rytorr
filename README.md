@@ -5,7 +5,7 @@ A BitTorrent client written in Rust.
 [![License](https://img.shields.io/badge/license-MIT-blue.svg)](
 https://github.com/Ryder-C/rytorr)
 
-![GIF](https://github.com/Ryder-C/rytorr/test_run.gif)
+![GIF](https://github.com/Ryder-C/rytorr/blob/main/test_run.gif)
 
 ## Features
 
