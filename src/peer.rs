@@ -138,7 +138,7 @@ impl PeerConnection {
         piece_sender: Sender<Piece>,
         piece_length: usize,
         piece_hashes: Arc<Vec<[u8; 20]>>,
-        downloaded_counter: Arc<RwLock<u64>>,
+        downloaded: Arc<RwLock<u64>>,
         uploaded: Arc<RwLock<u64>>,
         read_file_handle: Arc<Mutex<File>>,
         event_tx: UnboundedSender<Box<dyn PeerEventHandler + Send>>,
@@ -155,7 +155,7 @@ impl PeerConnection {
                     piece_sender.clone(),
                     piece_length,
                     piece_hashes.clone(),
-                    downloaded_counter.clone(),
+                    downloaded.clone(),
                     uploaded.clone(),
                     read_file_handle.clone(),
                     event_tx.clone(),
@@ -174,7 +174,7 @@ impl PeerConnection {
                     piece_sender.clone(),
                     piece_length,
                     piece_hashes.clone(),
-                    downloaded_counter.clone(),
+                    downloaded.clone(),
                     uploaded.clone(),
                     read_file_handle.clone(),
                     event_tx.clone(),
@@ -197,7 +197,7 @@ impl PeerConnection {
         piece_sender: Sender<Piece>,
         piece_length: usize,
         piece_hashes: Arc<Vec<[u8; 20]>>,
-        downloaded_counter: Arc<RwLock<u64>>,
+        downloaded: Arc<RwLock<u64>>,
         uploaded: Arc<RwLock<u64>>,
         read_file_handle: Arc<Mutex<File>>,
         event_tx: UnboundedSender<Box<dyn PeerEventHandler + Send>>,
@@ -227,7 +227,7 @@ impl PeerConnection {
             peer_interested: false,
             event_tx,
             cmd_rx,
-            downloaded: downloaded_counter,
+            downloaded,
             uploaded,
             read_file_handle,
             piece_download_progress,
@@ -243,7 +243,7 @@ impl PeerConnection {
         piece_sender: Sender<Piece>,
         piece_length: usize,
         piece_hashes: Arc<Vec<[u8; 20]>>,
-        downloaded_counter: Arc<RwLock<u64>>,
+        downloaded: Arc<RwLock<u64>>,
         uploaded: Arc<RwLock<u64>>,
         read_file_handle: Arc<Mutex<File>>,
         event_tx: UnboundedSender<Box<dyn PeerEventHandler + Send>>,
@@ -270,7 +270,7 @@ impl PeerConnection {
             peer_interested: false,
             event_tx,
             cmd_rx,
-            downloaded: downloaded_counter,
+            downloaded,
             uploaded,
             read_file_handle,
             piece_download_progress,
@@ -280,21 +280,27 @@ impl PeerConnection {
 
     #[tracing::instrument(skip(self))]
     pub async fn start(&mut self) {
-        // send our bitfield then express interest
+        // Send initial Bitfield (if we have pieces)
         if let Some(ref have) = self.have_bitfield {
-            debug!("Sending initial Bitfield");
-            if let Err(e) = self
-                .send_message(message::Message::Bitfield(have.clone()))
-                .await
-            {
-                error!(error = %e, "Failed to send initial Bitfield");
-                return; // Can't proceed without sending bitfield
+            if !have.is_empty() && have.any() {
+                // Only send if not empty and has pieces
+                debug!("Sending initial Bitfield");
+                if let Err(e) = self.send_message(Message::Bitfield(have.clone())).await {
+                    error!(error = %e, "Failed to send initial Bitfield");
+                    return; // Can't proceed without sending bitfield if we have pieces
+                }
+            } else {
+                trace!("Skipping initial Bitfield (empty or no pieces)");
             }
+        } else {
+            trace!("Skipping initial Bitfield (not initialized)");
         }
-        debug!("Sending Interested");
-        if let Err(e) = self.send_message(message::Message::Interested).await {
-            error!(error = %e, "Failed to send Interested");
-            return; // Can't proceed if we can't express interest
+
+        // Send initial Interested state update (which might send Interested or NotInterested)
+        debug!("Updating initial interest state");
+        if let Err(e) = self.update_interest_state().await {
+            error!(error = %e, "Failed to send initial interest state message");
+            // Decide if we should return or continue
         }
 
         let mut len_buf = [0u8; 4];

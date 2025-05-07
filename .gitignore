@@ -15,3 +15,6 @@ Cargo.lock
 
 # VisualStudioCode
 .vscode
+
+# Downloaded torrents
+*.download

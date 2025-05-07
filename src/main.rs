@@ -1,6 +1,7 @@
 mod engine;
 mod file;
 mod peer;
+mod status;
 mod swarm;
 mod tracker;
 
@@ -14,8 +15,11 @@ const TORRENT_DIR: &str = "test_torrents";
 
 #[tokio::main]
 async fn main() {
-    // Initialize tracing subscriber
-    tracing_subscriber::fmt::init();
+    // Initialize tracing subscriber to write to stderr
+    tracing_subscriber::fmt()
+        .with_max_level(tracing::Level::INFO) // Keep level INFO for now
+        .with_writer(std::io::stderr) // Send logs to stderr
+        .init();
 
     info!("Starting Rytorr Engine...");
 

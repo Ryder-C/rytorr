@@ -9,6 +9,8 @@ use anyhow::Result;
 use async_channel::{Receiver, Sender};
 use async_trait::async_trait;
 use bit_vec::BitVec;
+use rand::seq::SliceRandom;
+use rand::thread_rng;
 use tokio::{
     fs::{File, OpenOptions},
     io::{AsyncSeekExt, AsyncWriteExt, SeekFrom},
@@ -16,7 +18,7 @@ use tokio::{
     sync::{
         mpsc,
         mpsc::{unbounded_channel, UnboundedReceiver, UnboundedSender},
-        Mutex, Notify, OwnedSemaphorePermit, RwLock, Semaphore,
+        Mutex, Notify, OwnedSemaphorePermit, RwLock, Semaphore, TryAcquireError,
     },
     time::sleep,
 };
@@ -32,9 +34,14 @@ use self::handlers::SwarmCommandHandler;
 
 pub(crate) mod handlers; // Declare the handlers submodule and make it crate-visible
 
-const MAX_CONCURRENT_HANDSHAKES: usize = 10;
+const MAX_PEER_CONNECTIONS: usize = 10; // Limit total active connections
+const UPLOAD_SLOTS: usize = 4; // Number of peers to unchoke based on merit (plus 1 optimistic)
 const REQUEST_TIMEOUT: Duration = Duration::from_secs(30);
 const PIPELINE_DEPTH: usize = 5; // Max blocks to request consecutively from one peer for one piece
+
+// Make type alias crate-visible
+pub(crate) type PeerCmdSender = UnboundedSender<Box<dyn handlers::SwarmCommandHandler + Send>>;
+pub(crate) type PeerMapArc = Arc<Mutex<HashMap<Peer, PeerCmdSender>>>;
 
 #[derive(Debug, Clone)]
 pub enum PeerEvent {
@@ -47,6 +54,7 @@ pub enum PeerEvent {
 pub struct Swarm {
     peer_reciever: mpsc::Receiver<PendingPeer>,
     channel: (Sender<Piece>, Receiver<Piece>),
+    peers: HashSet<Peer>,
     my_id: String,
     torrent_name: String,
     piece_length: u64,
@@ -54,9 +62,9 @@ pub struct Swarm {
     downloaded: Arc<RwLock<u64>>,
     uploaded: Arc<RwLock<u64>>,
     peer_states: Arc<Mutex<HashMap<Peer, PeerState>>>,
-    peer_cmd_senders:
-        Arc<Mutex<HashMap<Peer, UnboundedSender<Box<dyn handlers::SwarmCommandHandler + Send>>>>>,
+    peer_cmd_senders: PeerMapArc,
     read_file_handle: Option<Arc<Mutex<File>>>,
+    connection_semaphore: Arc<Semaphore>,
 }
 
 // Async task to write pieces to disk and update global have bitfield
@@ -173,9 +181,7 @@ fn calculate_rarity(
 async fn scheduler_loop(
     peer_states: Arc<Mutex<HashMap<Peer, PeerState>>>,
     global_have: Arc<Mutex<BitVec>>,
-    senders: Arc<
-        Mutex<HashMap<Peer, UnboundedSender<Box<dyn handlers::SwarmCommandHandler + Send>>>>,
-    >,
+    senders: PeerMapArc,
     piece_length: usize,
     num_pieces: usize,
     notify: Arc<Notify>,
@@ -249,6 +255,11 @@ async fn scheduler_loop(
                 };
 
                 if let Some(tx) = tx_option {
+                    if let Some(peer_state) = states.get(&peer) {
+                        trace!(peer.ip = %peer.ip, peer.state = ?peer_state, piece_index = piece_idx, "Scheduler: Sending request to selected peer.");
+                    } else {
+                        warn!(peer.ip = %peer.ip, piece_index = piece_idx, "Scheduler: Peer state not found just before sending request!");
+                    }
                     debug!(peer.ip = %peer.ip, piece_index = piece_idx, "Found candidate peer for piece");
 
                     let piece_len_u32 = piece_length as u32;
@@ -432,6 +443,7 @@ impl PeerEventHandler for UnchokeEventHandler {
         if !st.is_unchoked {
             st.is_unchoked = true;
             notify.notify_one(); // State changed
+            info!(peer.ip = %self.peer.ip, "EventLoop: Registered UNCHOKE from peer");
             debug!(peer.ip = %self.peer.ip, "EventLoop: Unchoked peer");
         } else {
             trace!(peer.ip = %self.peer.ip, "EventLoop: Peer was already unchoked");
@@ -456,6 +468,7 @@ impl PeerEventHandler for ChokeEventHandler {
             if st.is_unchoked {
                 st.is_unchoked = false;
                 notify.notify_one(); // State changed
+                info!(peer.ip = %self.peer.ip, "EventLoop: Registered CHOKE from peer");
                 debug!(peer.ip = %self.peer.ip, "EventLoop: Choked peer");
             } else {
                 trace!(peer.ip = %self.peer.ip, "EventLoop: Peer was already choked");
@@ -492,9 +505,7 @@ async fn event_loop(
 #[instrument(skip_all)]
 async fn broadcast_have_loop(
     mut completed_piece_rx: UnboundedReceiver<usize>,
-    senders: Arc<
-        Mutex<HashMap<Peer, UnboundedSender<Box<dyn handlers::SwarmCommandHandler + Send>>>>,
-    >,
+    senders: PeerMapArc,
 ) {
     info!("Starting Have broadcast loop");
     while let Some(piece_index) = completed_piece_rx.recv().await {
@@ -519,8 +530,79 @@ async fn broadcast_have_loop(
     error!("Have broadcast loop exited unexpectedly");
 }
 
+/// Periodically reviews connected peers and decides which ones to choke/unchoke.
+#[instrument(skip_all)]
+async fn choking_loop(senders: PeerMapArc) {
+    info!("Starting choking loop");
+    let mut interval = tokio::time::interval(Duration::from_secs(10));
+    interval.tick().await; // Consume the initial immediate tick
+
+    loop {
+        interval.tick().await;
+        debug!("Evaluating peers for choking/unchoking");
+
+        let senders_map = senders.lock().await;
+        let peers: Vec<Peer> = senders_map.keys().cloned().collect();
+        let peer_count = peers.len();
+        trace!(peer_count, "Found peers for choke evaluation");
+
+        if peers.is_empty() {
+            trace!("No peers to evaluate, skipping choke cycle.");
+            continue;
+        }
+
+        let mut unchoke_candidates = HashSet::new();
+
+        if peer_count <= UPLOAD_SLOTS {
+            // Unchoke everyone if we have few peers
+            debug!(peer_count, max_slots = UPLOAD_SLOTS, "Unchoking all peers (below slot limit)");
+            unchoke_candidates.extend(peers.iter().cloned());
+        } else {
+            // --- Select top peers (Replace with actual rate logic later) ---
+            // For now, just pick the first few as a placeholder
+            let mut main_unchoke = peers.iter().take(UPLOAD_SLOTS).cloned().collect::<HashSet<_>>();
+            debug!(peer_count = main_unchoke.len(), "Selected main unchoke candidates (placeholder logic)");
+            unchoke_candidates.extend(main_unchoke.drain()); // Use extend + drain
+
+            // --- Optimistic Unchoke ---
+            // Find peers not already selected
+            let mut potential_optimistic: Vec<Peer> = peers.iter()
+                                                          .filter(|p| !unchoke_candidates.contains(p))
+                                                          .cloned()
+                                                          .collect();
+
+            if let Some(optimistic_peer) = potential_optimistic.choose(&mut thread_rng()).cloned() {
+                 debug!(peer.ip = %optimistic_peer.ip, "Selected optimistic unchoke");
+                unchoke_candidates.insert(optimistic_peer);
+            } else {
+                 trace!("No candidates left for optimistic unchoke");
+            }
+        }
+
+        // --- Apply Choke/Unchoke ---
+        for (peer, tx) in senders_map.iter() {
+            let should_be_unchoked = unchoke_candidates.contains(peer);
+            let command: Box<dyn handlers::SwarmCommandHandler + Send> = if should_be_unchoked {
+                trace!(peer.ip = %peer.ip, "Sending Unchoke command");
+                Box::new(handlers::UnchokePeerCommand)
+            } else {
+                 trace!(peer.ip = %peer.ip, "Sending Choke command");
+                Box::new(handlers::ChokePeerCommand)
+            };
+
+            if let Err(e) = tx.send(command) {
+                error!(error = %e, peer.ip = %peer.ip, "Failed to send choke/unchoke command");
+                // Consider removing peer if channel is closed
+            }
+        }
+        // Drop the lock before sleeping
+        drop(senders_map);
+    }
+     // warn!("Choking loop finished unexpectedly"); // Add if needed
+}
+
 impl Swarm {
-    #[instrument(skip(peer_reciever, pieces, downloaded, uploaded))]
+    #[instrument(skip(peer_reciever, pieces, downloaded, uploaded, peer_cmd_senders))]
     pub fn new(
         peer_reciever: mpsc::Receiver<PendingPeer>,
         my_id: String,
@@ -529,11 +611,13 @@ impl Swarm {
         pieces: Arc<Vec<[u8; 20]>>,
         downloaded: Arc<RwLock<u64>>,
         uploaded: Arc<RwLock<u64>>,
+        peer_cmd_senders: PeerMapArc,
     ) -> Self {
         info!(torrent_name, my_id, piece_length, "Creating new Swarm");
         Self {
             peer_reciever,
             channel: async_channel::unbounded(),
+            peers: HashSet::new(),
             my_id,
             torrent_name,
             piece_length,
@@ -541,8 +625,9 @@ impl Swarm {
             downloaded,
             uploaded,
             peer_states: Arc::new(Mutex::new(HashMap::new())),
-            peer_cmd_senders: Arc::new(Mutex::new(HashMap::new())),
+            peer_cmd_senders,
             read_file_handle: None,
+            connection_semaphore: Arc::new(Semaphore::new(MAX_PEER_CONNECTIONS)),
         }
     }
 
@@ -617,7 +702,7 @@ impl Swarm {
         tokio::spawn(scheduler_loop(
             peer_states_for_scheduler,
             have_clone_scheduler,
-            senders_arc,
+            senders_arc.clone(), // Clone Arc for scheduler
             piece_length_usize,
             num_pieces,
             notify_clone_scheduler,
@@ -632,74 +717,101 @@ impl Swarm {
             senders_clone_broadcast,
         ));
 
-        let semaphore = Arc::new(Semaphore::new(MAX_CONCURRENT_HANDSHAKES));
+        // --- Spawn Choking Loop --- 
+        let senders_for_choking = self.peer_cmd_senders.clone();
+        tokio::spawn(choking_loop(senders_for_choking));
+        // --- End Spawn ---
+
+        // Main loop to accept new peers
+        let semaphore = self.connection_semaphore.clone(); // Use the struct field
         loop {
-            debug!("Waiting for new peer...");
-            // Use select to allow graceful shutdown in the future
-            let new_peer = match self.peer_reciever.recv().await {
-                Some(p) => p,
-                None => {
-                    info!("Peer receiver channel closed, ending swarm loop.");
-                    break;
-                }
-            };
+            debug!("Waiting for new peer or semaphore permit...");
 
-            let peer_obj = match &new_peer {
-                PendingPeer::Incoming(p, _) => p.clone(),
-                PendingPeer::Outgoing(p) => p.clone(),
-            };
-            // Check against peer_cmd_senders map instead of self.peers
-            if self.peer_cmd_senders.lock().await.contains_key(&peer_obj) {
-                debug!(peer.ip = %peer_obj.ip, "Peer already connected or being connected");
-                continue;
+            // Wait for a peer OR for a permit to become available if we were previously full
+            // Select ensures we check for peers even while waiting for a permit.
+            tokio::select! {
+                // Branch 1: Receive a new peer from the channel
+                maybe_peer = self.peer_reciever.recv() => {
+                    let new_peer = match maybe_peer {
+                        Some(p) => p,
+                        None => {
+                            info!("Peer receiver channel closed, ending swarm loop.");
+                            break;
+                        }
+                    };
+
+                    let peer_obj = match &new_peer {
+                        PendingPeer::Incoming(p, _) => p.clone(),
+                        PendingPeer::Outgoing(p) => p.clone(),
+                    };
+
+                    // Check if already connected
+                    if self.peer_cmd_senders.lock().await.contains_key(&peer_obj) {
+                        debug!(peer.ip = %peer_obj.ip, "Peer already connected or being connected, skipping.");
+                        continue;
+                    }
+
+                    // --- Try to acquire permit --- 
+                    match self.connection_semaphore.clone().try_acquire_owned() {
+                        Ok(permit) => {
+                            // --- Permit acquired --- 
+                            info!(peer = ?peer_obj, available_permits = self.connection_semaphore.available_permits(), "Acquired connection permit, processing peer");
+                            
+                            let (cmd_tx, cmd_rx) = unbounded_channel();
+                            // Optimistically insert sender
+                            self.peer_cmd_senders.lock().await.insert(peer_obj.clone(), cmd_tx);
+
+                            let read_handle = match &self.read_file_handle {
+                                Some(handle) => handle.clone(),
+                                None => {
+                                    error!(peer.ip=%peer_obj.ip, "Cannot connect peer, read file handle is not available.");
+                                    self.peer_cmd_senders.lock().await.remove(&peer_obj);
+                                    // NOTE: Permit is dropped here implicitly as 'permit' goes out of scope
+                                    continue;
+                                }
+                            };
+                            let progress_clone_peer = piece_download_progress.clone();
+                            let pending_clone_peer = pending_requests.clone();
+
+                            // Spawn the peer task, passing the permit
+                            self.introduce_peer(
+                                new_peer,
+                                info_hash.clone(),
+                                permit, // Pass the acquired permit
+                                self.channel.0.clone(),
+                                self.piece_length as usize,
+                                self.pieces.clone(),
+                                self.uploaded.clone(),
+                                read_handle,
+                                evt_tx.clone(),
+                                cmd_rx,
+                                progress_clone_peer,
+                                pending_clone_peer,
+                            )
+                            .await;
+                        }
+                        Err(TryAcquireError::NoPermits) => {
+                            // --- At connection limit --- 
+                            warn!(peer = ?peer_obj, max_connections = MAX_PEER_CONNECTIONS, "Connection limit reached, dropping peer.");
+                            // Discard the peer, permit not acquired
+                            continue;
+                        }
+                        Err(TryAcquireError::Closed) => {
+                            // --- Semaphore closed (unexpected) --- 
+                            error!("Connection semaphore closed unexpectedly, exiting swarm loop.");
+                            break;
+                        }
+                    }
+                },
+                // Branch 2: Wait for a permit if we might be blocked
+                // This isn't strictly necessary with try_acquire in the loop,
+                // but can make the loop slightly more responsive if it was full.
+                // Ok(_permit) = self.connection_semaphore.clone().acquire_owned() => {
+                //    trace!("Permit became available while waiting.");
+                //    // Permit acquired here is immediately dropped, 
+                //    // the loop continues and will try_acquire again if a peer arrives.
+                // }
             }
-            info!(peer = ?peer_obj, "Received new potential peer");
-
-            let permit = match semaphore.clone().acquire_owned().await {
-                Ok(p) => p,
-                Err(_) => {
-                    error!("Semaphore closed unexpectedly");
-                    break; // Stop processing if semaphore is closed
-                }
-            };
-            let piece_sender = self.channel.0.clone();
-            let (cmd_tx, cmd_rx) = unbounded_channel();
-
-            // Optimistically insert sender BEFORE spawning task
-            self.peer_cmd_senders
-                .lock()
-                .await
-                .insert(peer_obj.clone(), cmd_tx);
-
-            // Ensure read_file_handle is available
-            let read_handle = match &self.read_file_handle {
-                Some(handle) => handle.clone(),
-                None => {
-                    error!(peer.ip=%peer_obj.ip, "Cannot connect peer, read file handle is not available.");
-                    // Remove the sender we just added
-                    self.peer_cmd_senders.lock().await.remove(&peer_obj);
-                    continue; // Skip this peer
-                }
-            };
-
-            let progress_clone_peer = piece_download_progress.clone();
-            let pending_clone_peer = pending_requests.clone();
-
-            self.introduce_peer(
-                new_peer,
-                info_hash.clone(),
-                permit,
-                piece_sender,
-                self.piece_length as usize,
-                self.pieces.clone(),
-                self.uploaded.clone(),
-                read_handle,
-                evt_tx.clone(),
-                cmd_rx,
-                progress_clone_peer,
-                pending_clone_peer,
-            )
-            .await;
         }
         info!("Swarm start loop finished");
     }
@@ -732,7 +844,7 @@ impl Swarm {
         self,
         peer,
         info_hash,
-        _permit,
+        permit,
         piece_sender,
         piece_length,
         piece_hashes,
@@ -745,7 +857,7 @@ impl Swarm {
         &self,
         peer: PendingPeer,
         info_hash: Arc<Vec<u8>>,
-        _permit: OwnedSemaphorePermit,
+        permit: OwnedSemaphorePermit,
         piece_sender: Sender<Piece>,
         piece_length: usize,
         piece_hashes: Arc<Vec<[u8; 20]>>,
@@ -757,13 +869,9 @@ impl Swarm {
         pending_requests: Arc<Mutex<HashMap<(usize, u32), Instant>>>,
     ) {
         let id = self.my_id.clone();
-        let downloaded_counter = self.downloaded.clone();
-        // --- Clone shared state for the task --- Need peer_states too
+        let downloaded = self.downloaded.clone();
         let peer_cmd_senders_clone = self.peer_cmd_senders.clone();
         let peer_states_clone = self.peer_states.clone();
-        // --- End Clone ---
-
-        // Clone peer details early in case PeerConnection::new fails
         let initial_peer_details = match &peer {
             PendingPeer::Outgoing(p) => p.clone(),
             PendingPeer::Incoming(p, _) => p.clone(),
@@ -772,16 +880,19 @@ impl Swarm {
 
         tokio::spawn(
             async move {
+                // Move permit into the task, it's dropped automatically on task exit
+                let _permit = permit;
+                
                 let peer_ip = initial_peer_details.ip.clone();
                 info!(peer.ip = %peer_ip, "Attempting connection");
                 let mut peer_connection = match PeerConnection::new(
-                    peer, // This moves `peer`
+                    peer,
                     id,
                     info_hash,
                     piece_sender,
                     piece_length,
                     piece_hashes,
-                    downloaded_counter,
+                    downloaded,
                     uploaded.clone(),
                     read_file_handle.clone(),
                     peer_event_tx,
@@ -793,30 +904,23 @@ impl Swarm {
                 {
                     Ok(connection) => connection,
                     Err(e) => {
-                        warn!(peer.ip = %peer_ip, error = %e, "Failed to establish connection");
-                        // Cleanup the sender we added optimistically
-                        {
-                             let mut senders_map = peer_cmd_senders_clone.lock().await;
-                             if senders_map.remove(&initial_peer_details).is_some() {
-                                 trace!(peer = ?initial_peer_details, "Removed command sender after connection failure.");
-                             } else {
-                                 warn!(peer = ?initial_peer_details, "Command sender not found during cleanup after connection failure.");
-                             }
-                        }
-                        return;
+                         warn!(peer.ip = %peer_ip, error = %e, "Failed to establish connection");
+                         {
+                            let mut senders_map = peer_cmd_senders_clone.lock().await;
+                            if senders_map.remove(&initial_peer_details).is_some() {
+                                trace!(peer = ?initial_peer_details, "Removed command sender after connection failure.");
+                            } else {
+                                warn!(peer = ?initial_peer_details, "Command sender not found during cleanup after connection failure.");
+                            }
+                         }
+                         return; // Permit is dropped here
                     }
                 };
 
-                // Use the peer details from the established connection
                 let peer_details = peer_connection.peer.clone();
                 info!(peer = ?peer_details, "Connection established, starting loop");
-
                 peer_connection.start().await;
-
-                // --- Cleanup after connection closes ---
                 info!(peer = ?peer_details, "Connection closed. Cleaning up...");
-
-                // Remove command sender
                 {
                     let mut senders_map = peer_cmd_senders_clone.lock().await;
                     if senders_map.remove(&peer_details).is_some() {
@@ -825,8 +929,6 @@ impl Swarm {
                         warn!(peer = ?peer_details, "Command sender not found during cleanup.");
                     }
                 }
-
-                // Remove peer state
                 {
                     let mut states_map = peer_states_clone.lock().await;
                     if states_map.remove(&peer_details).is_some() {
@@ -835,9 +937,15 @@ impl Swarm {
                          warn!(peer = ?peer_details, "Peer state not found during cleanup.");
                     }
                 }
-                 info!(peer = ?peer_details, "Cleanup finished.");
+                info!(peer = ?peer_details, "Cleanup finished.");
+                // Permit (_permit) is dropped here automatically
             }
             .instrument(tracing::info_span!("peer_connection_task", peer.ip = %peer_ip_for_span)),
         );
+    }
+
+    /// Returns a clone of the Arc containing the peer command sender map.
+    pub fn get_peer_cmd_senders_arc(&self) -> PeerMapArc {
+        self.peer_cmd_senders.clone()
     }
 }

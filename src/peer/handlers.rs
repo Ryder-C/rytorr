@@ -175,8 +175,10 @@ impl MessageHandler for RequestHandler {
 
         // Validation
         if connection.am_choking {
-            trace!(peer.ip = %connection.peer.ip, "Ignoring request: We are choking peer");
+            trace!(peer.ip = %connection.peer.ip, piece_index = self.index, "Ignoring request: We are choking peer (am_choking=true)");
             return;
+        } else {
+            trace!(peer.ip = %connection.peer.ip, piece_index = self.index, "Processing request: We are not choking peer (am_choking=false)");
         }
 
         if self.length as usize > BLOCK_SIZE {
@@ -188,42 +190,47 @@ impl MessageHandler for RequestHandler {
         let block_len = self.length as usize;
         let mut block_data = vec![0u8; block_len];
         let offset = self.index as u64 * connection.piece_length as u64 + self.begin as u64;
+        trace!(peer.ip = %connection.peer.ip, piece_index = self.index, offset, "Calculated file offset for request");
 
         // Lock file, seek, and read
         let mut file_guard = connection.read_file_handle.lock().await;
+        trace!(peer.ip = %connection.peer.ip, piece_index = self.index, offset, "Acquired file lock for reading");
         if let Err(e) = file_guard.seek(SeekFrom::Start(offset)).await {
             error!(error = %e, peer.ip = %connection.peer.ip, offset, "Failed to seek in file for request");
-            return;
+            return; // Cannot fulfill request
         }
+        trace!(peer.ip = %connection.peer.ip, piece_index = self.index, offset, "Seek successful");
+
         match file_guard.read_exact(&mut block_data).await {
             Ok(_) => {
                 trace!(peer.ip = %connection.peer.ip, offset, len = block_len, "Read block from file successfully");
-                // Drop the lock before potentially long-running send
-                drop(file_guard);
+                drop(file_guard); // Drop lock before sending
 
-                // Construct and send Piece message
                 let piece_msg = message::Message::Piece(self.index, self.begin, block_data);
+                let log_len = if let message::Message::Piece(_, _, ref data) = piece_msg {
+                    data.len()
+                } else {
+                    0
+                };
+                trace!(peer.ip = %connection.peer.ip, piece_index = self.index, begin = self.begin, len = log_len, "Constructed Piece message, attempting send");
                 if let Err(e) = connection.send_message(piece_msg).await {
                     error!(error = %e, peer.ip = %connection.peer.ip, "Failed to send Piece message");
-                    // Connection might be dead
-                    return;
+                    return; // Connection might be dead
                 }
+                trace!(peer.ip = %connection.peer.ip, piece_index = self.index, begin = self.begin, "Successfully sent Piece message");
 
-                // Update upload counter
-                let mut uploaded = connection.uploaded.write().await;
+                let mut uploaded = connection.uploaded.write().await; // Use renamed field
                 *uploaded += block_len as u64;
                 trace!(peer.ip = %connection.peer.ip, added = block_len, total_uploaded = *uploaded, "Updated uploaded count");
             }
             Err(e) => {
                 error!(error = %e, peer.ip = %connection.peer.ip, offset, len = block_len, "Failed to read block from file for request");
-                // Don't send anything if read failed
             }
         }
     }
 }
 
 pub(super) struct PieceHandler {
-    // Made fields public
     pub index: u32,
     pub begin: u32,
     pub block: Vec<u8>,
@@ -232,6 +239,7 @@ pub(super) struct PieceHandler {
 #[async_trait]
 impl MessageHandler for PieceHandler {
     async fn handle(&self, connection: &mut PeerConnection) {
+        trace!(peer.ip = %connection.peer.ip, piece_index = self.index, begin = self.begin, block_len = self.block.len(), "PieceHandler: Received piece message bytes.");
         let piece_index = self.index as usize; // Use usize for map keys
         let begin = self.begin;
         let block = self.block.clone(); // Clone data to avoid borrow issues if needed later
@@ -338,7 +346,7 @@ impl MessageHandler for PieceHandler {
                     "Piece completed and verified"
                 );
 
-                // Increment the global downloaded counter
+                // Increment the global downloaded counter using renamed field
                 {
                     let mut downloaded = connection.downloaded.write().await;
                     *downloaded += piece_len as u64;
