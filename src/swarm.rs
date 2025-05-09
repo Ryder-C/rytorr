@@ -30,9 +30,7 @@ use crate::{
     peer::{Peer, PeerConnection, BLOCK_SIZE},
 };
 
-use self::handlers::SwarmCommandHandler;
-
-pub(crate) mod handlers; // Declare the handlers submodule and make it crate-visible
+pub(crate) mod handlers;
 
 const MAX_PEER_CONNECTIONS: usize = 50; // Limit total active connections
 const UPLOAD_SLOTS: usize = 5; // Number of peers to unchoke based on merit (plus 1 optimistic)
@@ -42,14 +40,6 @@ const PIPELINE_DEPTH: usize = 5; // Max blocks to request consecutively from one
 // Make type alias crate-visible
 pub(crate) type PeerCmdSender = UnboundedSender<Box<dyn handlers::SwarmCommandHandler + Send>>;
 pub(crate) type PeerMapArc = Arc<Mutex<HashMap<Peer, PeerCmdSender>>>;
-
-#[derive(Debug, Clone)]
-pub enum PeerEvent {
-    Bitfield(Peer, BitVec),
-    Have(Peer, usize),
-    Unchoke(Peer),
-    Choke(Peer),
-}
 
 pub struct Swarm {
     peer_reciever: mpsc::Receiver<PendingPeer>,
@@ -554,27 +544,39 @@ async fn choking_loop(senders: PeerMapArc) {
 
         if peer_count <= UPLOAD_SLOTS {
             // Unchoke everyone if we have few peers
-            debug!(peer_count, max_slots = UPLOAD_SLOTS, "Unchoking all peers (below slot limit)");
+            debug!(
+                peer_count,
+                max_slots = UPLOAD_SLOTS,
+                "Unchoking all peers (below slot limit)"
+            );
             unchoke_candidates.extend(peers.iter().cloned());
         } else {
             // --- Select top peers (Replace with actual rate logic later) ---
             // For now, just pick the first few as a placeholder
-            let mut main_unchoke = peers.iter().take(UPLOAD_SLOTS).cloned().collect::<HashSet<_>>();
-            debug!(peer_count = main_unchoke.len(), "Selected main unchoke candidates (placeholder logic)");
+            let mut main_unchoke = peers
+                .iter()
+                .take(UPLOAD_SLOTS)
+                .cloned()
+                .collect::<HashSet<_>>();
+            debug!(
+                peer_count = main_unchoke.len(),
+                "Selected main unchoke candidates (placeholder logic)"
+            );
             unchoke_candidates.extend(main_unchoke.drain()); // Use extend + drain
 
             // --- Optimistic Unchoke ---
             // Find peers not already selected
-            let mut potential_optimistic: Vec<Peer> = peers.iter()
-                                                          .filter(|p| !unchoke_candidates.contains(p))
-                                                          .cloned()
-                                                          .collect();
+            let mut potential_optimistic: Vec<Peer> = peers
+                .iter()
+                .filter(|p| !unchoke_candidates.contains(p))
+                .cloned()
+                .collect();
 
             if let Some(optimistic_peer) = potential_optimistic.choose(&mut thread_rng()).cloned() {
-                 debug!(peer.ip = %optimistic_peer.ip, "Selected optimistic unchoke");
+                debug!(peer.ip = %optimistic_peer.ip, "Selected optimistic unchoke");
                 unchoke_candidates.insert(optimistic_peer);
             } else {
-                 trace!("No candidates left for optimistic unchoke");
+                trace!("No candidates left for optimistic unchoke");
             }
         }
 
@@ -585,7 +587,7 @@ async fn choking_loop(senders: PeerMapArc) {
                 trace!(peer.ip = %peer.ip, "Sending Unchoke command");
                 Box::new(handlers::UnchokePeerCommand)
             } else {
-                 trace!(peer.ip = %peer.ip, "Sending Choke command");
+                trace!(peer.ip = %peer.ip, "Sending Choke command");
                 Box::new(handlers::ChokePeerCommand)
             };
 
@@ -597,7 +599,7 @@ async fn choking_loop(senders: PeerMapArc) {
         // Drop the lock before sleeping
         drop(senders_map);
     }
-     // warn!("Choking loop finished unexpectedly"); // Add if needed
+    // warn!("Choking loop finished unexpectedly"); // Add if needed
 }
 
 impl Swarm {
@@ -715,7 +717,7 @@ impl Swarm {
             senders_clone_broadcast,
         ));
 
-        // --- Spawn Choking Loop --- 
+        // --- Spawn Choking Loop ---
         let senders_for_choking = self.peer_cmd_senders.clone();
         tokio::spawn(choking_loop(senders_for_choking));
         // --- End Spawn ---
@@ -749,12 +751,12 @@ impl Swarm {
                         continue;
                     }
 
-                    // --- Try to acquire permit --- 
+                    // --- Try to acquire permit ---
                     match self.connection_semaphore.clone().try_acquire_owned() {
                         Ok(permit) => {
-                            // --- Permit acquired --- 
+                            // --- Permit acquired ---
                             info!(peer = ?peer_obj, available_permits = self.connection_semaphore.available_permits(), "Acquired connection permit, processing peer");
-                            
+
                             let (cmd_tx, cmd_rx) = unbounded_channel();
                             // Optimistically insert sender
                             self.peer_cmd_senders.lock().await.insert(peer_obj.clone(), cmd_tx);
@@ -789,13 +791,13 @@ impl Swarm {
                             .await;
                         }
                         Err(TryAcquireError::NoPermits) => {
-                            // --- At connection limit --- 
+                            // --- At connection limit ---
                             warn!(peer = ?peer_obj, max_connections = MAX_PEER_CONNECTIONS, "Connection limit reached, dropping peer.");
                             // Discard the peer, permit not acquired
                             continue;
                         }
                         Err(TryAcquireError::Closed) => {
-                            // --- Semaphore closed (unexpected) --- 
+                            // --- Semaphore closed (unexpected) ---
                             error!("Connection semaphore closed unexpectedly, exiting swarm loop.");
                             break;
                         }
@@ -806,7 +808,7 @@ impl Swarm {
                 // but can make the loop slightly more responsive if it was full.
                 // Ok(_permit) = self.connection_semaphore.clone().acquire_owned() => {
                 //    trace!("Permit became available while waiting.");
-                //    // Permit acquired here is immediately dropped, 
+                //    // Permit acquired here is immediately dropped,
                 //    // the loop continues and will try_acquire again if a peer arrives.
                 // }
             }
@@ -880,7 +882,7 @@ impl Swarm {
             async move {
                 // Move permit into the task, it's dropped automatically on task exit
                 let _permit = permit;
-                
+
                 let peer_ip = initial_peer_details.ip.clone();
                 info!(peer.ip = %peer_ip, "Attempting connection");
                 let mut peer_connection = match PeerConnection::new(

@@ -2,7 +2,7 @@ use std::{sync::Arc, time::Duration};
 use tokio::{
     net::TcpStream,
     sync::{
-        mpsc::{self, Receiver, Sender, UnboundedSender},
+        mpsc::{self, Receiver, Sender},
         watch, Mutex, RwLock,
     },
     time::Instant,
@@ -12,7 +12,7 @@ use torrex::bencode::Torrent;
 use crate::{
     peer::Peer,
     status,
-    swarm::{handlers::SwarmCommandHandler, PeerMapArc, Swarm},
+    swarm::{PeerMapArc, Swarm},
     tracker::{http, udp, Trackable, TrackerType},
 };
 use anyhow::{bail, Result};
@@ -145,7 +145,7 @@ impl TorrentClient {
         });
     }
 
-    pub fn start_tracking(&self, peer_cmd_senders: PeerMapArc) {
+    pub fn start_tracking(&self) {
         const LOW_PEER_THRESHOLD: usize = 5;
         const MIN_ANNOUNCE_INTERVAL_SECS: u64 = 30;
 
@@ -155,7 +155,7 @@ impl TorrentClient {
         let size = self.size;
         let next_tracker_announce_times_clone = self.next_tracker_announce_times.clone();
 
-        let (low_peer_tx, _) = watch::channel(false);
+        let (low_peer_tx, low_peer_rx) = watch::channel(false);
 
         let monitor_peer_map = self.peer_cmd_senders.clone();
         let monitor_torrent_name = self.torrent.info.name.clone();
@@ -201,9 +201,8 @@ impl TorrentClient {
             let key_url_for_task = tracker_url_from_list.clone();
 
             let info_hash_clone_tracker = info_hash_arc.clone();
-            let peer_map_clone_tracker = peer_cmd_senders.clone();
             let tracker_times_updater_clone = next_tracker_announce_times_clone.clone();
-            let mut low_peer_rx_clone = low_peer_tx.subscribe();
+            let mut low_peer_rx_clone = low_peer_rx.clone();
 
             tokio::spawn(async move {
                 let mut tracker = match Self::create_tracker(
@@ -308,10 +307,6 @@ impl TorrentClient {
             TrackerType::Udp => Box::new(udp::Udp::new(url, info_hash, peer_id, port, size)?),
         })
     }
-
-    pub fn init_tracking(&self, peer_cmd_senders: PeerMapArc) {
-        self.start_tracking(peer_cmd_senders);
-    }
 }
 
 pub struct Engine {
@@ -343,7 +338,7 @@ impl Engine {
             .await
             .insert(info_hash, client.clone());
 
-        client.start_tracking(client.peer_cmd_senders.clone());
+        client.start_tracking();
 
         Ok(())
     }
