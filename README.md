@@ -27,3 +27,4 @@ https://github.com/Ryder-C/rytorr)
 * [ ] CLI Tool
 * [ ] Seeding capabilities
 * [ ] Selective file downloading
+* [ ] Dynamic pipelining (request blocks depending on peers observed bandwith delay product)

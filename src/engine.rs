@@ -5,6 +5,7 @@ use tokio::{
         mpsc::{self, Receiver, Sender, UnboundedSender},
         Mutex, RwLock,
     },
+    time::Instant,
 };
 use torrex::bencode::Torrent;
 
@@ -36,20 +37,22 @@ pub struct TorrentClient {
     leechers: Arc<Mutex<u32>>,
     size: u64,
     peer_cmd_senders: PeerMapArc,
+    next_tracker_announce_times: Arc<Mutex<HashMap<String, Instant>>>,
 }
 
 impl TorrentClient {
     pub fn new(torrent: Torrent, port: u16) -> Self {
-        let torrent = Arc::new(torrent);
+        let torrent_arc = Arc::new(torrent);
         let peer_id = Self::generate_peer_id();
-        let size = torrent.info.files.iter().map(|f| f.length).sum();
+        let size = torrent_arc.info.files.iter().map(|f| f.length).sum();
 
         let (peer_sender, peer_reciever) = mpsc::channel(50);
 
-        let info_hash = Arc::new(torrent.info.hash.to_vec());
-        let pieces = Arc::new(torrent.info.pieces.clone());
+        let info_hash = Arc::new(torrent_arc.info.hash.to_vec());
+        let pieces = Arc::new(torrent_arc.info.pieces.clone());
         let downloaded = Arc::new(RwLock::new(0));
         let uploaded = Arc::new(RwLock::new(0));
+        let next_tracker_announce_times = Arc::new(Mutex::new(HashMap::new()));
 
         let peer_cmd_senders: PeerMapArc = Arc::new(Mutex::new(HashMap::new()));
 
@@ -59,16 +62,18 @@ impl TorrentClient {
             peer_id.clone(),
             port,
             info_hash,
-            torrent.info.name.clone(),
-            torrent.info.piece_length as u64,
+            torrent_arc.info.name.clone(),
+            torrent_arc.info.piece_length as u64,
             pieces,
             downloaded.clone(),
             uploaded.clone(),
             peer_cmd_senders.clone(),
+            size,
+            next_tracker_announce_times.clone(),
         );
 
         Self {
-            torrent,
+            torrent: torrent_arc,
             peer_sender,
             peer_id,
             port,
@@ -78,6 +83,7 @@ impl TorrentClient {
             leechers: Arc::new(Mutex::new(0)),
             size,
             peer_cmd_senders,
+            next_tracker_announce_times,
         }
     }
 
@@ -102,12 +108,14 @@ impl TorrentClient {
         downloaded: Arc<RwLock<u64>>,
         uploaded: Arc<RwLock<u64>>,
         peer_cmd_senders: PeerMapArc,
+        total_size: u64,
+        next_tracker_announce_times: Arc<Mutex<HashMap<String, Instant>>>,
     ) {
         tokio::spawn(async move {
             let mut swarm = Swarm::new(
                 reciever,
                 peer_id,
-                torrent_name,
+                torrent_name.clone(),
                 piece_length,
                 pieces.clone(),
                 downloaded.clone(),
@@ -115,8 +123,19 @@ impl TorrentClient {
                 peer_cmd_senders.clone(),
             );
 
-            let peer_map_for_status = peer_cmd_senders;
-            tokio::spawn(status::run_status_loop(peer_map_for_status));
+            let status_torrent_name = torrent_name;
+            let status_downloaded = downloaded;
+            let status_total_size = total_size;
+            let status_peer_map = peer_cmd_senders;
+            let status_tracker_times = next_tracker_announce_times;
+
+            tokio::spawn(status::run_status_loop(
+                status_torrent_name,
+                status_downloaded,
+                status_total_size,
+                status_tracker_times,
+                status_peer_map,
+            ));
             info!("Status loop spawned for swarm.");
 
             tokio::spawn(Swarm::listen_for_peers(sender.clone(), port));
@@ -131,27 +150,37 @@ impl TorrentClient {
         let info_hash = Arc::new(self.torrent.info.hash.to_vec());
         let port = self.port;
         let size = self.size;
+        let next_tracker_announce_times_clone = self.next_tracker_announce_times.clone();
 
-        for url in announce_list {
+        for tracker_url_from_list in announce_list {
             let peer_id = self.peer_id.clone();
             let downloaded = self.downloaded.clone();
             let uploaded = self.uploaded.clone();
             let seeders = self.seeders.clone();
             let leechers = self.leechers.clone();
             let sender = self.peer_sender.clone();
-            let url_clone = url.clone();
+
+            let url_for_tracker_creation = tracker_url_from_list.clone();
+            let key_url_for_task = tracker_url_from_list.clone();
+
             let info_hash_clone = info_hash.clone();
             let peer_map_clone = peer_cmd_senders.clone();
+            let tracker_times_updater = next_tracker_announce_times_clone.clone();
 
             tokio::spawn(async move {
-                let mut tracker =
-                    match Self::create_tracker(url_clone, info_hash_clone, peer_id, port, size) {
-                        Ok(t) => t,
-                        Err(e) => {
-                            error!(url = %url, error = %e, "Failed to create tracker");
-                            return;
-                        }
-                    };
+                let mut tracker = match Self::create_tracker(
+                    url_for_tracker_creation,
+                    info_hash_clone,
+                    peer_id,
+                    port,
+                    size,
+                ) {
+                    Ok(t) => t,
+                    Err(e) => {
+                        error!(url = %key_url_for_task, error = %e, "Failed to create tracker");
+                        return;
+                    }
+                };
 
                 let peer_map = peer_map_clone;
                 const LOW_PEER_THRESHOLD: usize = 5;
@@ -166,14 +195,14 @@ impl TorrentClient {
                     let response = match tracker.scrape() {
                         Ok(r) => r,
                         Err(e) => {
-                            error!(url = %url, error = %e, "Tracker scrape error");
+                            error!(url = %key_url_for_task, error = %e, "Tracker scrape error");
                             tokio::time::sleep(Duration::from_secs(MIN_ANNOUNCE_INTERVAL_SECS))
                                 .await;
                             continue;
                         }
                     };
 
-                    debug!(url = %url, peers_count = response.peers.len(), interval = response.interval, "Received response from tracker");
+                    debug!(url = %key_url_for_task, peers_count = response.peers.len(), interval = response.interval, "Received response from tracker");
 
                     for peer in response.peers {
                         if let Err(e) = sender.send(PendingPeer::Outgoing(peer)).await {
@@ -190,7 +219,7 @@ impl TorrentClient {
                     let current_peers = peer_map.lock().await.len();
                     let tracker_interval = response.interval as u64;
                     let sleep_duration_secs = if current_peers < LOW_PEER_THRESHOLD {
-                        debug!(url = %url, current_peers, threshold = LOW_PEER_THRESHOLD, "Peer count low, reducing announce interval.");
+                        debug!(url = %key_url_for_task, current_peers, threshold = LOW_PEER_THRESHOLD, "Peer count low, reducing announce interval.");
                         std::cmp::max(MIN_ANNOUNCE_INTERVAL_SECS, tracker_interval / 2)
                     } else {
                         tracker_interval
@@ -200,7 +229,13 @@ impl TorrentClient {
                         MIN_ANNOUNCE_INTERVAL_SECS,
                     ));
 
-                    trace!(url = %url, interval = ?final_sleep_duration, "Tracker loop sleeping.");
+                    let next_announce = Instant::now() + final_sleep_duration;
+                    {
+                        let mut times_map = tracker_times_updater.lock().await;
+                        times_map.insert(key_url_for_task.clone(), next_announce);
+                    }
+
+                    trace!(url = %key_url_for_task, interval = ?final_sleep_duration, "Tracker loop sleeping.");
                     tokio::time::sleep(final_sleep_duration).await;
                 }
             });

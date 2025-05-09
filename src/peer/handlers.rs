@@ -217,7 +217,7 @@ impl MessageHandler for RequestHandler {
                     error!(error = %e, peer.ip = %connection.peer.ip, "Failed to send Piece message");
                     return; // Connection might be dead
                 }
-                debug!(peer.ip = %connection.peer.ip, piece_index = self.index, begin = self.begin, "Successfully sent Piece message");
+                info!(peer.ip = %connection.peer.ip, piece_index = self.index, begin = self.begin, "Successfully sent Piece message");
 
                 let mut uploaded = connection.uploaded.write().await; // Use renamed field
                 *uploaded += block_len as u64;
@@ -340,7 +340,7 @@ impl MessageHandler for PieceHandler {
 
             if calculated_hash.as_slice() == expected_hash {
                 let piece_len = data.len(); // Get the actual length of the verified piece
-                info!(
+                debug!(
                     piece_index,
                     data_len = piece_len,
                     "Piece completed and verified"

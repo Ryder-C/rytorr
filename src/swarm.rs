@@ -54,7 +54,6 @@ pub enum PeerEvent {
 pub struct Swarm {
     peer_reciever: mpsc::Receiver<PendingPeer>,
     channel: (Sender<Piece>, Receiver<Piece>),
-    peers: HashSet<Peer>,
     my_id: String,
     torrent_name: String,
     piece_length: u64,
@@ -617,7 +616,6 @@ impl Swarm {
         Self {
             peer_reciever,
             channel: async_channel::unbounded(),
-            peers: HashSet::new(),
             my_id,
             torrent_name,
             piece_length,
