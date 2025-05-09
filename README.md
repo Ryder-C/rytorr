@@ -24,6 +24,6 @@ https://github.com/Ryder-C/rytorr)
 * [ ] Peer exchange (PEX)
 * [ ] Local Peer Discovery (LPD)
 * [ ] uTP (Micro Transport Protocol)
-* [ ] Web UI
+* [ ] CLI Tool
 * [ ] Seeding capabilities
 * [ ] Selective file downloading

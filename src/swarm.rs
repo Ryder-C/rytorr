@@ -34,8 +34,8 @@ use self::handlers::SwarmCommandHandler;
 
 pub(crate) mod handlers; // Declare the handlers submodule and make it crate-visible
 
-const MAX_PEER_CONNECTIONS: usize = 10; // Limit total active connections
-const UPLOAD_SLOTS: usize = 4; // Number of peers to unchoke based on merit (plus 1 optimistic)
+const MAX_PEER_CONNECTIONS: usize = 50; // Limit total active connections
+const UPLOAD_SLOTS: usize = 5; // Number of peers to unchoke based on merit (plus 1 optimistic)
 const REQUEST_TIMEOUT: Duration = Duration::from_secs(30);
 const PIPELINE_DEPTH: usize = 5; // Max blocks to request consecutively from one peer for one piece
 
