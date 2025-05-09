@@ -7,6 +7,12 @@ https://github.com/Ryder-C/rytorr)
 
 ![GIF](https://github.com/Ryder-C/rytorr/blob/main/test_run.gif)
 
+## Usage
+
+```bash
+rytorr <torrent_file_path>
+```
+
 ## Features
 
 * [x] Parsing of .torrent files
