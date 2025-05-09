@@ -3,7 +3,7 @@ use tokio::{
     net::TcpStream,
     sync::{
         mpsc::{self, Receiver, Sender, UnboundedSender},
-        Mutex, RwLock,
+        watch, Mutex, RwLock,
     },
     time::Instant,
 };
@@ -146,31 +146,69 @@ impl TorrentClient {
     }
 
     pub fn start_tracking(&self, peer_cmd_senders: PeerMapArc) {
+        const LOW_PEER_THRESHOLD: usize = 5;
+        const MIN_ANNOUNCE_INTERVAL_SECS: u64 = 30;
+
         let announce_list = self.torrent.announce_list.clone();
-        let info_hash = Arc::new(self.torrent.info.hash.to_vec());
+        let info_hash_arc = Arc::new(self.torrent.info.hash.to_vec());
         let port = self.port;
         let size = self.size;
         let next_tracker_announce_times_clone = self.next_tracker_announce_times.clone();
 
+        let (low_peer_tx, _) = watch::channel(false);
+
+        let monitor_peer_map = self.peer_cmd_senders.clone();
+        let monitor_torrent_name = self.torrent.info.name.clone();
+        let monitor_low_peer_tx = low_peer_tx.clone();
+
+        tokio::spawn(async move {
+            let mut currently_low = false;
+            if monitor_low_peer_tx.is_closed() {
+                debug!(torrent_name = %monitor_torrent_name, "Low peer notifier channel closed at monitor start. Task exiting.");
+                return;
+            }
+            loop {
+                tokio::time::sleep(Duration::from_secs(5)).await;
+
+                let num_peers = monitor_peer_map.lock().await.len();
+                let is_low = num_peers < LOW_PEER_THRESHOLD;
+
+                if is_low != currently_low {
+                    debug!(torrent_name = %monitor_torrent_name, num_peers, threshold = LOW_PEER_THRESHOLD, new_state_is_low = is_low, "Peer count threshold state changed.");
+                    if monitor_low_peer_tx.send(is_low).is_err() {
+                        warn!(torrent_name = %monitor_torrent_name, "Failed to send low peer notification; receivers likely dropped. Monitor task exiting.");
+                        break;
+                    }
+                    currently_low = is_low;
+                }
+
+                if monitor_low_peer_tx.is_closed() {
+                    warn!(torrent_name = %monitor_torrent_name, "Low peer notifier channel (sender side) closed. Monitor task exiting.");
+                    break;
+                }
+            }
+        });
+
         for tracker_url_from_list in announce_list {
             let peer_id = self.peer_id.clone();
-            let downloaded = self.downloaded.clone();
-            let uploaded = self.uploaded.clone();
-            let seeders = self.seeders.clone();
-            let leechers = self.leechers.clone();
-            let sender = self.peer_sender.clone();
+            let downloaded_arc = self.downloaded.clone();
+            let uploaded_arc = self.uploaded.clone();
+            let seeders_arc = self.seeders.clone();
+            let leechers_arc = self.leechers.clone();
+            let sender_clone = self.peer_sender.clone();
 
             let url_for_tracker_creation = tracker_url_from_list.clone();
             let key_url_for_task = tracker_url_from_list.clone();
 
-            let info_hash_clone = info_hash.clone();
-            let peer_map_clone = peer_cmd_senders.clone();
-            let tracker_times_updater = next_tracker_announce_times_clone.clone();
+            let info_hash_clone_tracker = info_hash_arc.clone();
+            let peer_map_clone_tracker = peer_cmd_senders.clone();
+            let tracker_times_updater_clone = next_tracker_announce_times_clone.clone();
+            let mut low_peer_rx_clone = low_peer_tx.subscribe();
 
             tokio::spawn(async move {
                 let mut tracker = match Self::create_tracker(
                     url_for_tracker_creation,
-                    info_hash_clone,
+                    info_hash_clone_tracker,
                     peer_id,
                     port,
                     size,
@@ -182,13 +220,9 @@ impl TorrentClient {
                     }
                 };
 
-                let peer_map = peer_map_clone;
-                const LOW_PEER_THRESHOLD: usize = 5;
-                const MIN_ANNOUNCE_INTERVAL_SECS: u64 = 30;
-
                 loop {
-                    let current_downloaded = *downloaded.read().await;
-                    let current_uploaded = *uploaded.read().await;
+                    let current_downloaded = *downloaded_arc.read().await;
+                    let current_uploaded = *uploaded_arc.read().await;
                     let left = size.saturating_sub(current_downloaded);
                     tracker.update_progress(current_downloaded, current_uploaded, left);
 
@@ -196,47 +230,62 @@ impl TorrentClient {
                         Ok(r) => r,
                         Err(e) => {
                             error!(url = %key_url_for_task, error = %e, "Tracker scrape error");
-                            tokio::time::sleep(Duration::from_secs(MIN_ANNOUNCE_INTERVAL_SECS))
-                                .await;
+                            let error_sleep_duration =
+                                Duration::from_secs(MIN_ANNOUNCE_INTERVAL_SECS);
+                            {
+                                let mut times_map = tracker_times_updater_clone.lock().await;
+                                times_map.insert(
+                                    key_url_for_task.clone(),
+                                    Instant::now() + error_sleep_duration,
+                                );
+                            }
+                            tokio::time::sleep(error_sleep_duration).await;
                             continue;
                         }
                     };
 
                     debug!(url = %key_url_for_task, peers_count = response.peers.len(), interval = response.interval, "Received response from tracker");
 
-                    for peer in response.peers {
-                        if let Err(e) = sender.send(PendingPeer::Outgoing(peer)).await {
+                    for peer_info in response.peers {
+                        if let Err(e) = sender_clone.send(PendingPeer::Outgoing(peer_info)).await {
                             error!(error = %e, "Failed to send peer to swarm");
                         }
                     }
                     if let Some(new_seeders) = response.seeders {
-                        *seeders.lock().await = new_seeders;
+                        *seeders_arc.lock().await = new_seeders;
                     }
                     if let Some(new_leechers) = response.leechers {
-                        *leechers.lock().await = new_leechers;
+                        *leechers_arc.lock().await = new_leechers;
                     }
 
-                    let current_peers = peer_map.lock().await.len();
-                    let tracker_interval = response.interval as u64;
-                    let sleep_duration_secs = if current_peers < LOW_PEER_THRESHOLD {
-                        debug!(url = %key_url_for_task, current_peers, threshold = LOW_PEER_THRESHOLD, "Peer count low, reducing announce interval.");
-                        std::cmp::max(MIN_ANNOUNCE_INTERVAL_SECS, tracker_interval / 2)
-                    } else {
-                        tracker_interval
-                    };
-                    let final_sleep_duration = Duration::from_secs(std::cmp::max(
-                        sleep_duration_secs,
-                        MIN_ANNOUNCE_INTERVAL_SECS,
-                    ));
+                    let base_announce_interval_secs =
+                        std::cmp::max(response.interval as u64, MIN_ANNOUNCE_INTERVAL_SECS);
+                    let base_sleep_duration = Duration::from_secs(base_announce_interval_secs);
 
-                    let next_announce = Instant::now() + final_sleep_duration;
                     {
-                        let mut times_map = tracker_times_updater.lock().await;
-                        times_map.insert(key_url_for_task.clone(), next_announce);
+                        let mut times_map = tracker_times_updater_clone.lock().await;
+                        times_map.insert(
+                            key_url_for_task.clone(),
+                            Instant::now() + base_sleep_duration,
+                        );
                     }
 
-                    trace!(url = %key_url_for_task, interval = ?final_sleep_duration, "Tracker loop sleeping.");
-                    tokio::time::sleep(final_sleep_duration).await;
+                    trace!(url = %key_url_for_task, interval = ?base_sleep_duration, "Tracker loop: planning to sleep or wait for low peer notification.");
+
+                    tokio::select! {
+                        biased;
+
+                        Ok(()) = low_peer_rx_clone.changed() => {
+                            if *low_peer_rx_clone.borrow() {
+                                info!(url = %key_url_for_task, "Low peer count signal received. Announcing sooner.");
+                            } else {
+                                trace!(url = %key_url_for_task, "Peer count no longer low (notification received). Proceeding with announce.");
+                            }
+                        }
+                        _ = tokio::time::sleep(base_sleep_duration) => {
+                            trace!(url = %key_url_for_task, "Tracker sleep normally elapsed.");
+                        }
+                    }
                 }
             });
         }
