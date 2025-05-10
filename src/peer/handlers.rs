@@ -3,7 +3,8 @@ use crate::{
     peer::{message, PeerConnection, BLOCK_SIZE},
     swarm::tasks::event_processor::{
         BitfieldEventHandler, ChokeEventHandler, HaveEventHandler, PeerEventHandler,
-        UnchokeEventHandler,
+        PeerInterestedEventHandler, PeerNotInterestedEventHandler, PeerReceivedBlockEventHandler,
+        PeerSentBlockEventHandler, UnchokeEventHandler,
     },
 };
 use async_trait::async_trait;
@@ -66,6 +67,12 @@ impl MessageHandler for InterestedHandler {
     async fn handle(&self, connection: &mut PeerConnection) {
         debug!("Received Interested");
         connection.connection_state.peer_interested = true;
+        let handler: Box<dyn PeerEventHandler + Send> = Box::new(PeerInterestedEventHandler {
+            peer: connection.peer.clone(),
+        });
+        if connection.event_tx.send(handler).is_err() {
+            error!(peer.ip = %connection.peer.ip, "Failed to send PeerInterestedEvent");
+        }
         // TODO: Implement unchoking logic (send Unchoke if we want to serve this peer)
         // if !connection.connection_state.am_choking { ... send Unchoke ... }
     }
@@ -78,6 +85,12 @@ impl MessageHandler for NotInterestedHandler {
     async fn handle(&self, connection: &mut PeerConnection) {
         debug!("Received NotInterested");
         connection.connection_state.peer_interested = false;
+        let handler: Box<dyn PeerEventHandler + Send> = Box::new(PeerNotInterestedEventHandler {
+            peer: connection.peer.clone(),
+        });
+        if connection.event_tx.send(handler).is_err() {
+            error!(peer.ip = %connection.peer.ip, "Failed to send PeerNotInterestedEvent");
+        }
     }
 }
 
@@ -221,6 +234,15 @@ impl MessageHandler for RequestHandler {
                 let mut uploaded = connection.uploaded.write().await; // Use renamed field
                 *uploaded += block_len as u64;
                 trace!(peer.ip = %connection.peer.ip, added = block_len, total_uploaded = *uploaded, "Updated uploaded count");
+
+                // Emit event for sent block
+                let event: Box<dyn PeerEventHandler + Send> = Box::new(PeerSentBlockEventHandler {
+                    peer: connection.peer.clone(),
+                    bytes: block_len as u64,
+                });
+                if connection.event_tx.send(event).is_err() {
+                    error!(peer.ip = %connection.peer.ip, "Failed to send PeerSentBlockEvent");
+                }
             }
             Err(e) => {
                 error!(error = %e, peer.ip = %connection.peer.ip, offset, len = block_len, "Failed to read block from file for request");
@@ -242,9 +264,18 @@ impl MessageHandler for PieceHandler {
         let piece_index = self.index as usize; // Use usize for map keys
         let begin = self.begin;
         let block = self.block.clone(); // Clone data to avoid borrow issues if needed later
-        let block_len = block.len() as u32;
+        let block_len = block.len(); // usize here
 
         debug!(piece_index, begin, block_len, "Received Piece block");
+
+        // Emit event for received block (before further processing for simplicity in rate counting)
+        let event: Box<dyn PeerEventHandler + Send> = Box::new(PeerReceivedBlockEventHandler {
+            peer: connection.peer.clone(),
+            bytes: block_len as u64,
+        });
+        if connection.event_tx.send(event).is_err() {
+            error!(peer.ip = %connection.peer.ip, "Failed to send PeerReceivedBlockEvent");
+        }
 
         // --- Update Shared State ---
         let block_key = (piece_index, begin);
@@ -263,7 +294,7 @@ impl MessageHandler for PieceHandler {
             );
         }
 
-        let next_expected_begin = begin + block_len;
+        let next_expected_begin = begin + block_len as u32;
         {
             let mut progress_guard = connection.piece_download_progress.lock().await;
             // Update progress only if this block moves the progress forward

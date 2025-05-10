@@ -152,42 +152,74 @@ async fn try_request_blocks_for_piece(
     piece_download_progress: Arc<Mutex<HashMap<usize, u32>>>,
     pending_requests: Arc<Mutex<HashMap<(usize, u32), Instant>>>,
 ) -> bool {
-    let candidate_peer = states.iter().find_map(|(p, s)| {
-        if s.is_unchoked && s.bitfield.get(piece_idx).unwrap_or(false) {
-            Some(p.clone())
-        } else {
-            None
-        }
-    });
+    let mut eligible_peers: Vec<(Peer, u64)> = states
+        .iter()
+        .filter_map(|(p, s)| {
+            // s.peer_is_choking_us == false means the peer is NOT choking US (i.e., we can request from them)
+            if !s.peer_is_choking_us && s.bitfield.get(piece_idx).unwrap_or(false) {
+                Some((p.clone(), s.download_rate_from_peer_since_last_cycle()))
+            } else {
+                None
+            }
+        })
+        .collect();
 
-    if let Some(peer) = candidate_peer {
+    // Sort peers by their download rate to us (our download rate from them), highest first.
+    eligible_peers.sort_unstable_by(|a, b| b.1.cmp(&a.1));
+
+    trace!(
+        piece_idx,
+        count = eligible_peers.len(),
+        "Found eligible peers for requesting piece"
+    );
+
+    for (peer, rate) in eligible_peers {
+        trace!(peer.ip = %peer.ip, download_rate_Bps_interval = rate, piece_idx, "Considering peer for request");
         let tx_option = {
             let senders_map = senders.lock().await;
             senders_map.get(&peer).cloned()
         };
 
         if let Some(tx) = tx_option {
-            if let Some(peer_state) = states.get(&peer) {
-                trace!(peer.ip = %peer.ip, peer.state = ?peer_state, piece_index = piece_idx, "Scheduler: Sending request to selected peer.");
+            // Check peer state again, as it might have changed slightly, though less likely here.
+            if let Some(current_peer_state) = states.get(&peer) {
+                if current_peer_state.peer_is_choking_us {
+                    trace!(peer.ip = %peer.ip, piece_idx, "Peer started choking us before pipelining, skipping");
+                    continue; // Try next peer
+                }
+                trace!(peer.ip = %peer.ip, peer.state = ?current_peer_state, piece_index = piece_idx, "Scheduler: Selected peer for potential pipelining.");
             } else {
-                warn!(peer.ip = %peer.ip, piece_index = piece_idx, "Scheduler: Peer state not found just before sending request!");
+                warn!(peer.ip = %peer.ip, piece_index = piece_idx, "Scheduler: Peer state disappeared before pipelining!");
+                continue; // Try next peer
             }
-            debug!(peer.ip = %peer.ip, piece_index = piece_idx, "Found candidate peer for piece");
+            debug!(peer.ip = %peer.ip, piece_index = piece_idx, download_rate_Bps_interval = rate, "Attempting to pipeline blocks from selected peer");
 
             let piece_len_u32 = piece_length as u32;
-            return pipeline_blocks_for_piece_from_peer(
+            if pipeline_blocks_for_piece_from_peer(
                 &tx,
                 &peer,
                 piece_idx,
                 piece_len_u32,
-                piece_download_progress,
-                pending_requests,
+                piece_download_progress.clone(),
+                pending_requests.clone(),
             )
-            .await;
+            .await
+            {
+                return true; // Successfully requested blocks from this peer
+            }
+            // If pipelining returned false, it means no blocks were requested from this peer (e.g. all pending, or piece complete for it)
+            // or an error occurred sending the request. We can try the next peer.
+            debug!(peer.ip = %peer.ip, piece_idx, "Pipelining did not request blocks or failed, trying next peer if any.");
         } else {
-            error!(peer.ip = %peer.ip, piece_index = piece_idx, "Scheduler: Could not find sender for found peer!");
+            // This case should be rare if peer is in states map, implies sender was removed concurrently
+            error!(peer.ip = %peer.ip, piece_index = piece_idx, "Scheduler: Could not find sender for eligible peer chosen for request!");
         }
     }
+
+    trace!(
+        piece_idx,
+        "No suitable peer found or all attempts to pipeline failed for piece"
+    );
     false
 }
 

@@ -7,7 +7,10 @@ use std::{hash::Hash, net::SocketAddr, sync::Arc};
 
 use crate::engine::PendingPeer;
 use crate::file::Piece;
-use crate::swarm::tasks::event_processor::PeerEventHandler;
+use crate::swarm::tasks::event_processor::{
+    LocalChokeEventHandler, LocalInterestUpdateEventHandler, LocalUnchokeEventHandler,
+    PeerEventHandler,
+};
 use anyhow::{ensure, Context, Result};
 use async_channel::Sender;
 use bendy::decoding::FromBencode;
@@ -398,10 +401,26 @@ impl PeerConnection {
             self.connection_state.am_interested = true;
             trace!("Becoming interested in peer {}", self.peer.ip);
             self.send_message(Message::Interested).await?;
+            let event: Box<dyn PeerEventHandler + Send> =
+                Box::new(LocalInterestUpdateEventHandler {
+                    peer: self.peer.clone(),
+                    am_interested: true,
+                });
+            if self.event_tx.send(event).is_err() {
+                error!(peer.ip = %self.peer.ip, "Failed to send LocalInterestUpdateEvent (true)");
+            }
         } else if self.connection_state.am_interested && !should_be_interested {
             self.connection_state.am_interested = false;
             trace!("Becoming not interested in peer {}", self.peer.ip);
             self.send_message(Message::NotInterested).await?;
+            let event: Box<dyn PeerEventHandler + Send> =
+                Box::new(LocalInterestUpdateEventHandler {
+                    peer: self.peer.clone(),
+                    am_interested: false,
+                });
+            if self.event_tx.send(event).is_err() {
+                error!(peer.ip = %self.peer.ip, "Failed to send LocalInterestUpdateEvent (false)");
+            }
         }
         // No change needed if state matches calculation
         Ok(())
@@ -415,6 +434,12 @@ impl PeerConnection {
             self.connection_state.am_choking = true;
             trace!("Choking peer {}", self.peer.ip);
             self.send_message(Message::Choke).await?;
+            let event: Box<dyn PeerEventHandler + Send> = Box::new(LocalChokeEventHandler {
+                peer: self.peer.clone(),
+            });
+            if self.event_tx.send(event).is_err() {
+                error!(peer.ip = %self.peer.ip, "Failed to send LocalChokeEvent");
+            }
         }
         Ok(())
     }
@@ -427,6 +452,12 @@ impl PeerConnection {
             self.connection_state.am_choking = false;
             trace!("Unchoking peer {}", self.peer.ip);
             self.send_message(Message::Unchoke).await?;
+            let event: Box<dyn PeerEventHandler + Send> = Box::new(LocalUnchokeEventHandler {
+                peer: self.peer.clone(),
+            });
+            if self.event_tx.send(event).is_err() {
+                error!(peer.ip = %self.peer.ip, "Failed to send LocalUnchokeEvent");
+            }
         }
         Ok(())
     }

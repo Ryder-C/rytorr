@@ -107,13 +107,13 @@ impl PeerEventHandler for UnchokeEventHandler {
             debug!(peer.ip = %self.peer.ip, "EventLoop: Creating new state for Unchoke");
             PeerState::new(num_pieces)
         });
-        if !st.is_unchoked {
-            st.is_unchoked = true;
+        // This event means the PEER unchoked US.
+        if st.peer_is_choking_us {
+            st.peer_is_choking_us = false;
             notify.notify_one(); // State changed
-            info!(peer.ip = %self.peer.ip, "EventLoop: Registered UNCHOKE from peer");
-            debug!(peer.ip = %self.peer.ip, "EventLoop: Unchoked peer");
+            info!(peer.ip = %self.peer.ip, "EventLoop: Registered UNCHOKE from peer (peer_is_choking_us = false)");
         } else {
-            trace!(peer.ip = %self.peer.ip, "EventLoop: Peer was already unchoked");
+            trace!(peer.ip = %self.peer.ip, "EventLoop: Peer was already unchoking us");
         }
     }
 }
@@ -133,17 +133,205 @@ impl PeerEventHandler for ChokeEventHandler {
     ) {
         let mut states_guard = states.lock().await;
         if let Some(st) = states_guard.get_mut(&self.peer) {
-            if st.is_unchoked {
-                st.is_unchoked = false;
+            // This event means the PEER choked US.
+            if !st.peer_is_choking_us {
+                st.peer_is_choking_us = true;
                 notify.notify_one(); // State changed
-                info!(peer.ip = %self.peer.ip, "EventLoop: Registered CHOKE from peer");
-                debug!(peer.ip = %self.peer.ip, "EventLoop: Choked peer");
+                info!(peer.ip = %self.peer.ip, "EventLoop: Registered CHOKE from peer (peer_is_choking_us = true)");
             } else {
-                trace!(peer.ip = %self.peer.ip, "EventLoop: Peer was already choked");
+                trace!(peer.ip = %self.peer.ip, "EventLoop: Peer was already choking us");
             }
         } else {
             debug!(peer.ip = %self.peer.ip, "EventLoop: Received Choke for peer not in state map (might have disconnected)");
         }
+    }
+}
+
+// --- New Event Handlers for PeerState ---
+
+#[derive(Debug)]
+pub(crate) struct PeerInterestedEventHandler {
+    pub(crate) peer: Peer,
+}
+
+#[async_trait]
+impl PeerEventHandler for PeerInterestedEventHandler {
+    async fn handle(
+        &self,
+        states: &Mutex<HashMap<Peer, PeerState>>,
+        global_have: &Mutex<BitVec>,
+        notify: &Notify,
+    ) {
+        let num_pieces = global_have.lock().await.len();
+        let mut states_guard = states.lock().await;
+        let st = states_guard
+            .entry(self.peer.clone())
+            .or_insert_with(|| PeerState::new(num_pieces));
+        if !st.peer_is_interested_in_us {
+            st.peer_is_interested_in_us = true;
+            notify.notify_one();
+            debug!(peer.ip = %self.peer.ip, "EventLoop: Peer is now interested in us");
+        }
+    }
+}
+
+#[derive(Debug)]
+pub(crate) struct PeerNotInterestedEventHandler {
+    pub(crate) peer: Peer,
+}
+
+#[async_trait]
+impl PeerEventHandler for PeerNotInterestedEventHandler {
+    async fn handle(
+        &self,
+        states: &Mutex<HashMap<Peer, PeerState>>,
+        global_have: &Mutex<BitVec>,
+        notify: &Notify,
+    ) {
+        let num_pieces = global_have.lock().await.len();
+        let mut states_guard = states.lock().await;
+        let st = states_guard
+            .entry(self.peer.clone())
+            .or_insert_with(|| PeerState::new(num_pieces));
+        if st.peer_is_interested_in_us {
+            st.peer_is_interested_in_us = false;
+            notify.notify_one();
+            debug!(peer.ip = %self.peer.ip, "EventLoop: Peer is no longer interested in us");
+        }
+    }
+}
+
+#[derive(Debug)]
+pub(crate) struct LocalChokeEventHandler {
+    // We decided to choke this peer
+    pub(crate) peer: Peer,
+}
+
+#[async_trait]
+impl PeerEventHandler for LocalChokeEventHandler {
+    async fn handle(
+        &self,
+        states: &Mutex<HashMap<Peer, PeerState>>,
+        global_have: &Mutex<BitVec>,
+        notify: &Notify,
+    ) {
+        let num_pieces = global_have.lock().await.len();
+        let mut states_guard = states.lock().await;
+        let st = states_guard
+            .entry(self.peer.clone())
+            .or_insert_with(|| PeerState::new(num_pieces));
+        if !st.am_choking_peer {
+            st.am_choking_peer = true;
+            notify.notify_one();
+            debug!(peer.ip = %self.peer.ip, "EventLoop: We are now choking peer");
+        }
+    }
+}
+
+#[derive(Debug)]
+pub(crate) struct LocalUnchokeEventHandler {
+    // We decided to unchoke this peer
+    pub(crate) peer: Peer,
+}
+
+#[async_trait]
+impl PeerEventHandler for LocalUnchokeEventHandler {
+    async fn handle(
+        &self,
+        states: &Mutex<HashMap<Peer, PeerState>>,
+        global_have: &Mutex<BitVec>,
+        notify: &Notify,
+    ) {
+        let num_pieces = global_have.lock().await.len();
+        let mut states_guard = states.lock().await;
+        let st = states_guard
+            .entry(self.peer.clone())
+            .or_insert_with(|| PeerState::new(num_pieces));
+        if st.am_choking_peer {
+            st.am_choking_peer = false;
+            notify.notify_one();
+            debug!(peer.ip = %self.peer.ip, "EventLoop: We are no longer choking peer");
+        }
+    }
+}
+
+#[derive(Debug)]
+pub(crate) struct LocalInterestUpdateEventHandler {
+    // Our interest in peer changed
+    pub(crate) peer: Peer,
+    pub(crate) am_interested: bool,
+}
+
+#[async_trait]
+impl PeerEventHandler for LocalInterestUpdateEventHandler {
+    async fn handle(
+        &self,
+        states: &Mutex<HashMap<Peer, PeerState>>,
+        global_have: &Mutex<BitVec>,
+        notify: &Notify,
+    ) {
+        let num_pieces = global_have.lock().await.len();
+        let mut states_guard = states.lock().await;
+        let st = states_guard
+            .entry(self.peer.clone())
+            .or_insert_with(|| PeerState::new(num_pieces));
+        if st.we_are_interested_in_peer != self.am_interested {
+            st.we_are_interested_in_peer = self.am_interested;
+            notify.notify_one();
+            debug!(peer.ip = %self.peer.ip, am_interested = self.am_interested, "EventLoop: Our interest in peer updated");
+        }
+    }
+}
+
+#[derive(Debug)]
+pub(crate) struct PeerSentBlockEventHandler {
+    // We sent a block to a peer
+    pub(crate) peer: Peer,
+    pub(crate) bytes: u64,
+}
+
+#[async_trait]
+impl PeerEventHandler for PeerSentBlockEventHandler {
+    async fn handle(
+        &self,
+        states: &Mutex<HashMap<Peer, PeerState>>,
+        global_have: &Mutex<BitVec>,
+        _notify: &Notify,
+    ) {
+        let num_pieces = global_have.lock().await.len();
+        let mut states_guard = states.lock().await;
+        let st = states_guard
+            .entry(self.peer.clone())
+            .or_insert_with(|| PeerState::new(num_pieces));
+        st.total_uploaded_to_peer += self.bytes;
+        // No notify needed, scheduler/choker will read this periodically
+        trace!(peer.ip = %self.peer.ip, bytes = self.bytes, total_uploaded = st.total_uploaded_to_peer, "EventLoop: Updated uploaded bytes to peer");
+    }
+}
+
+#[derive(Debug)]
+pub(crate) struct PeerReceivedBlockEventHandler {
+    // We received a block from a peer
+    pub(crate) peer: Peer,
+    pub(crate) bytes: u64,
+}
+
+#[async_trait]
+impl PeerEventHandler for PeerReceivedBlockEventHandler {
+    async fn handle(
+        &self,
+        states: &Mutex<HashMap<Peer, PeerState>>,
+        global_have: &Mutex<BitVec>,
+        _notify: &Notify,
+    ) {
+        let num_pieces = global_have.lock().await.len();
+        let mut states_guard = states.lock().await;
+        let st = states_guard
+            .entry(self.peer.clone())
+            .or_insert_with(|| PeerState::new(num_pieces));
+        st.total_downloaded_from_peer += self.bytes;
+        // No notify needed, scheduler/choker will read this periodically
+        trace!(peer.ip = %self.peer.ip, bytes = self.bytes, total_downloaded = st.total_downloaded_from_peer, "EventLoop: Updated downloaded bytes from peer");
     }
 }
 

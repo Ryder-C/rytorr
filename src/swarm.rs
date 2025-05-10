@@ -174,6 +174,7 @@ impl Swarm {
         info!("Spawning Choking loop");
         tokio::spawn(tasks::choking::choking_loop(
             ctx.peer_cmd_senders.clone(),
+            ctx.peer_states.clone(),
             upload_slots_for_choking,
         ));
     }
