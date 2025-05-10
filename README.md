@@ -34,3 +34,4 @@ rytorr <torrent_file_path>
 * [ ] Seeding capabilities
 * [ ] Selective file downloading
 * [ ] Dynamic pipelining (request blocks depending on peers observed bandwith delay product)
+* [ ] Endgame state (request remaining blocks from all peers)
