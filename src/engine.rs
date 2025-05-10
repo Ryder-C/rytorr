@@ -12,7 +12,7 @@ use torrex::bencode::Torrent;
 use crate::{
     peer::Peer,
     status,
-    swarm::{PeerMapArc, Swarm},
+    swarm::{PeerMapArc, Swarm, SwarmArgs, SwarmConfig},
     tracker::{http, udp, Trackable, TrackerType},
 };
 use anyhow::{bail, Result};
@@ -24,6 +24,23 @@ use tracing::{debug, error, info, instrument, trace, warn};
 pub enum PendingPeer {
     Outgoing(Peer),
     Incoming(Peer, TcpStream),
+}
+
+// Struct to group arguments for TorrentClient::start_swarm
+pub(crate) struct StartSwarmArgs {
+    peer_channel_sender: Sender<PendingPeer>,
+    peer_channel_receiver: Receiver<PendingPeer>,
+    peer_id: String,
+    listen_port: u16,
+    info_hash: Arc<Vec<u8>>,
+    torrent_name: String,
+    piece_length: u64,
+    pieces: Arc<Vec<[u8; 20]>>,
+    downloaded_stat: Arc<RwLock<u64>>,
+    uploaded_stat: Arc<RwLock<u64>>,
+    peer_cmd_senders_map: PeerMapArc,
+    total_torrent_size: u64,
+    tracker_announce_times: Arc<Mutex<HashMap<String, Instant>>>,
 }
 
 pub struct TorrentClient {
@@ -46,7 +63,7 @@ impl TorrentClient {
         let peer_id = Self::generate_peer_id();
         let size = torrent_arc.info.files.iter().map(|f| f.length).sum();
 
-        let (peer_sender, peer_reciever) = mpsc::channel(50);
+        let (peer_sender, peer_receiver) = mpsc::channel(50);
 
         let info_hash = Arc::new(torrent_arc.info.hash.to_vec());
         let pieces = Arc::new(torrent_arc.info.pieces.clone());
@@ -56,21 +73,23 @@ impl TorrentClient {
 
         let peer_cmd_senders: PeerMapArc = Arc::new(Mutex::new(HashMap::new()));
 
-        Self::start_swarm(
-            peer_sender.clone(),
-            peer_reciever,
-            peer_id.clone(),
-            port,
-            info_hash,
-            torrent_arc.info.name.clone(),
-            torrent_arc.info.piece_length as u64,
-            pieces,
-            downloaded.clone(),
-            uploaded.clone(),
-            peer_cmd_senders.clone(),
-            size,
-            next_tracker_announce_times.clone(),
-        );
+        let start_swarm_args = StartSwarmArgs {
+            peer_channel_sender: peer_sender.clone(),
+            peer_channel_receiver: peer_receiver,
+            peer_id: peer_id.clone(),
+            listen_port: port,
+            info_hash: info_hash.clone(), // Clone Arc for transfer
+            torrent_name: torrent_arc.info.name.clone(),
+            piece_length: torrent_arc.info.piece_length as u64,
+            pieces: pieces.clone(), // Clone Arc for transfer
+            downloaded_stat: downloaded.clone(),
+            uploaded_stat: uploaded.clone(),
+            peer_cmd_senders_map: peer_cmd_senders.clone(),
+            total_torrent_size: size,
+            tracker_announce_times: next_tracker_announce_times.clone(),
+        };
+
+        Self::start_swarm(start_swarm_args);
 
         Self {
             torrent: torrent_arc,
@@ -96,38 +115,34 @@ impl TorrentClient {
         peer_id
     }
 
-    pub fn start_swarm(
-        sender: Sender<PendingPeer>,
-        reciever: Receiver<PendingPeer>,
-        peer_id: String,
-        port: u16,
-        info_hash: Arc<Vec<u8>>,
-        torrent_name: String,
-        piece_length: u64,
-        pieces: Arc<Vec<[u8; 20]>>,
-        downloaded: Arc<RwLock<u64>>,
-        uploaded: Arc<RwLock<u64>>,
-        peer_cmd_senders: PeerMapArc,
-        total_size: u64,
-        next_tracker_announce_times: Arc<Mutex<HashMap<String, Instant>>>,
-    ) {
+    pub fn start_swarm(args: StartSwarmArgs) {
         tokio::spawn(async move {
+            let swarm_args = SwarmArgs {
+                my_id: args.peer_id,
+                torrent_name: args.torrent_name.clone(), // Clone for SwarmArgs
+                piece_length: args.piece_length,
+                pieces: args.pieces.clone(), // Clone Arc for SwarmArgs
+            };
+
+            let swarm_config = SwarmConfig {
+                max_peer_connections: 50,
+                upload_slots: 4,
+            };
+
             let mut swarm = Swarm::new(
-                reciever,
-                peer_id,
-                torrent_name.clone(),
-                piece_length,
-                pieces.clone(),
-                downloaded.clone(),
-                uploaded.clone(),
-                peer_cmd_senders.clone(),
+                args.peer_channel_receiver,
+                swarm_args,
+                swarm_config,
+                args.downloaded_stat.clone(),
+                args.uploaded_stat.clone(),
+                args.peer_cmd_senders_map.clone(),
             );
 
-            let status_torrent_name = torrent_name;
-            let status_downloaded = downloaded;
-            let status_total_size = total_size;
-            let status_peer_map = peer_cmd_senders;
-            let status_tracker_times = next_tracker_announce_times;
+            let status_torrent_name = args.torrent_name; // Name moved, not cloned again unless necessary
+            let status_downloaded = args.downloaded_stat;
+            let status_total_size = args.total_torrent_size;
+            let status_peer_map = args.peer_cmd_senders_map;
+            let status_tracker_times = args.tracker_announce_times;
 
             tokio::spawn(status::run_status_loop(
                 status_torrent_name,
@@ -138,9 +153,12 @@ impl TorrentClient {
             ));
             info!("Status loop spawned for swarm.");
 
-            tokio::spawn(Swarm::listen_for_peers(sender.clone(), port));
+            tokio::spawn(Swarm::listen_for_peers(
+                args.peer_channel_sender,
+                args.listen_port,
+            ));
 
-            swarm.start(info_hash).await;
+            swarm.start(args.info_hash).await;
             warn!("Swarm processing loop finished.");
         });
     }

@@ -7,7 +7,7 @@ use std::{hash::Hash, net::SocketAddr, sync::Arc};
 
 use crate::engine::PendingPeer;
 use crate::file::Piece;
-use crate::swarm::PeerEventHandler;
+use crate::swarm::tasks::event_processor::PeerEventHandler;
 use anyhow::{ensure, Context, Result};
 use async_channel::Sender;
 use bendy::decoding::FromBencode;
@@ -100,31 +100,61 @@ impl FromBencode for Peer {
     }
 }
 
+// New struct for PeerConnection arguments - make it pub(crate)
+pub(crate) struct PeerConnectionArgs {
+    pub(crate) my_id: String,
+    pub(crate) info_hash: Arc<Vec<u8>>,
+    pub(crate) piece_sender: Sender<Piece>,
+    pub(crate) piece_length: usize,
+    pub(crate) piece_hashes: Arc<Vec<[u8; 20]>>,
+    pub(crate) downloaded: Arc<RwLock<u64>>,
+    pub(crate) uploaded: Arc<RwLock<u64>>,
+    pub(crate) read_file_handle: Arc<Mutex<File>>,
+    pub(crate) event_tx: UnboundedSender<Box<dyn PeerEventHandler + Send>>,
+    pub(crate) piece_download_progress: Arc<Mutex<HashMap<usize, u32>>>,
+    pub(crate) pending_requests: Arc<Mutex<HashMap<(usize, u32), Instant>>>,
+}
+
+#[derive(Debug, Clone, Copy)]
+struct ConnectionStateFlags {
+    pub(crate) am_choking: bool,
+    pub(crate) am_interested: bool,
+    pub(crate) peer_choking: bool,
+    pub(crate) peer_interested: bool,
+}
+
+impl ConnectionStateFlags {
+    fn new() -> Self {
+        Self {
+            am_choking: true,
+            am_interested: false,
+            peer_choking: true,
+            peer_interested: false,
+        }
+    }
+}
+
 pub struct PeerConnection {
     pub peer: Peer,
-    pub piece_sender: Sender<Piece>,
-    piece_length: usize,
-    piece_hashes: Arc<Vec<[u8; 20]>>,
-    pending_pieces: HashMap<usize, Vec<Option<Vec<u8>>>>,
-    my_id: String,
+    pub(crate) piece_sender: Sender<Piece>,
+    pub(crate) piece_length: usize,
+    pub(crate) piece_hashes: Arc<Vec<[u8; 20]>>,
+    pub(crate) pending_pieces: HashMap<usize, Vec<Option<Vec<u8>>>>,
+    pub(crate) my_id: String,
     stream: TcpStream,
     pub peer_bitfield: Option<BitVec>,
     pub have_bitfield: Option<BitVec>,
 
-    am_choking: bool,
-    am_interested: bool,
-    peer_choking: bool,
-    peer_interested: bool,
+    pub(crate) connection_state: ConnectionStateFlags,
 
-    event_tx: UnboundedSender<Box<dyn PeerEventHandler + Send>>,
+    pub(crate) event_tx: UnboundedSender<Box<dyn PeerEventHandler + Send>>,
     cmd_rx: UnboundedReceiver<Box<dyn SwarmCommandHandler + Send>>,
 
-    // Shared state from Swarm
-    downloaded: Arc<RwLock<u64>>,
-    uploaded: Arc<RwLock<u64>>,
-    read_file_handle: Arc<Mutex<File>>,
-    piece_download_progress: Arc<Mutex<HashMap<usize, u32>>>,
-    pending_requests: Arc<Mutex<HashMap<(usize, u32), Instant>>>,
+    pub(crate) downloaded: Arc<RwLock<u64>>,
+    pub(crate) uploaded: Arc<RwLock<u64>>,
+    pub(crate) read_file_handle: Arc<Mutex<File>>,
+    pub(crate) piece_download_progress: Arc<Mutex<HashMap<usize, u32>>>,
+    pub(crate) pending_requests: Arc<Mutex<HashMap<(usize, u32), Instant>>>,
 }
 
 // --- PeerConnection Implementation ---
@@ -133,148 +163,74 @@ impl PeerConnection {
 
     pub async fn new(
         peer: PendingPeer,
-        my_id: String,
-        info_hash: Arc<Vec<u8>>,
-        piece_sender: Sender<Piece>,
-        piece_length: usize,
-        piece_hashes: Arc<Vec<[u8; 20]>>,
-        downloaded: Arc<RwLock<u64>>,
-        uploaded: Arc<RwLock<u64>>,
-        read_file_handle: Arc<Mutex<File>>,
-        event_tx: UnboundedSender<Box<dyn PeerEventHandler + Send>>,
+        args: PeerConnectionArgs,
         cmd_rx: UnboundedReceiver<Box<dyn SwarmCommandHandler + Send>>,
-        piece_download_progress: Arc<Mutex<HashMap<usize, u32>>>,
-        pending_requests: Arc<Mutex<HashMap<(usize, u32), Instant>>>,
     ) -> Result<Self> {
-        let conn = match peer {
-            PendingPeer::Outgoing(p) => {
-                Self::new_outgoing(
-                    p,
-                    my_id,
-                    info_hash,
-                    piece_sender.clone(),
-                    piece_length,
-                    piece_hashes.clone(),
-                    downloaded.clone(),
-                    uploaded.clone(),
-                    read_file_handle.clone(),
-                    event_tx.clone(),
-                    cmd_rx,
-                    piece_download_progress.clone(),
-                    pending_requests.clone(),
-                )
-                .await?
-            }
-            PendingPeer::Incoming(p, s) => {
-                Self::new_incoming(
-                    p,
-                    s,
-                    my_id,
-                    info_hash,
-                    piece_sender.clone(),
-                    piece_length,
-                    piece_hashes.clone(),
-                    downloaded.clone(),
-                    uploaded.clone(),
-                    read_file_handle.clone(),
-                    event_tx.clone(),
-                    cmd_rx,
-                    piece_download_progress.clone(),
-                    pending_requests.clone(),
-                )
-                .await?
-            }
-        };
-        // This init seems redundant now, should be handled by Swarm
-        // conn.pending_pieces = HashMap::new();
-        Ok(conn)
+        match peer {
+            PendingPeer::Outgoing(p) => Self::new_outgoing(p, args, cmd_rx).await,
+            PendingPeer::Incoming(p, s) => Self::new_incoming(p, s, args, cmd_rx).await,
+        }
     }
 
     async fn new_outgoing(
         peer: Peer,
-        my_id: String,
-        info_hash: Arc<Vec<u8>>,
-        piece_sender: Sender<Piece>,
-        piece_length: usize,
-        piece_hashes: Arc<Vec<[u8; 20]>>,
-        downloaded: Arc<RwLock<u64>>,
-        uploaded: Arc<RwLock<u64>>,
-        read_file_handle: Arc<Mutex<File>>,
-        event_tx: UnboundedSender<Box<dyn PeerEventHandler + Send>>,
+        args: PeerConnectionArgs,
         cmd_rx: UnboundedReceiver<Box<dyn SwarmCommandHandler + Send>>,
-        piece_download_progress: Arc<Mutex<HashMap<usize, u32>>>,
-        pending_requests: Arc<Mutex<HashMap<(usize, u32), Instant>>>,
     ) -> Result<Self> {
         let mut stream = TcpStream::connect(format!("{}:{}", peer.ip, peer.port))
             .await
             .context("Connect to TcpStream")?;
-        Self::write_handshake(&mut stream, &info_hash, &my_id).await?;
-        Self::read_handshake(&mut stream, &info_hash).await?;
-        let have = BitVec::from_elem(piece_hashes.len(), false);
+        Self::write_handshake(&mut stream, &args.info_hash, &args.my_id).await?;
+        Self::read_handshake(&mut stream, &args.info_hash).await?;
+        let have = BitVec::from_elem(args.piece_hashes.len(), false);
         Ok(Self {
             peer,
-            piece_sender,
-            piece_length,
-            piece_hashes,
+            piece_sender: args.piece_sender,
+            piece_length: args.piece_length,
+            piece_hashes: args.piece_hashes,
             pending_pieces: HashMap::new(),
-            my_id,
+            my_id: args.my_id,
             stream,
             peer_bitfield: None,
             have_bitfield: Some(have),
-            am_choking: true,
-            am_interested: false,
-            peer_choking: true,
-            peer_interested: false,
-            event_tx,
+            connection_state: ConnectionStateFlags::new(),
+            event_tx: args.event_tx,
             cmd_rx,
-            downloaded,
-            uploaded,
-            read_file_handle,
-            piece_download_progress,
-            pending_requests,
+            downloaded: args.downloaded,
+            uploaded: args.uploaded,
+            read_file_handle: args.read_file_handle,
+            piece_download_progress: args.piece_download_progress,
+            pending_requests: args.pending_requests,
         })
     }
 
     async fn new_incoming(
         peer: Peer,
         mut stream: TcpStream,
-        my_id: String,
-        info_hash: Arc<Vec<u8>>,
-        piece_sender: Sender<Piece>,
-        piece_length: usize,
-        piece_hashes: Arc<Vec<[u8; 20]>>,
-        downloaded: Arc<RwLock<u64>>,
-        uploaded: Arc<RwLock<u64>>,
-        read_file_handle: Arc<Mutex<File>>,
-        event_tx: UnboundedSender<Box<dyn PeerEventHandler + Send>>,
+        args: PeerConnectionArgs,
         cmd_rx: UnboundedReceiver<Box<dyn SwarmCommandHandler + Send>>,
-        piece_download_progress: Arc<Mutex<HashMap<usize, u32>>>,
-        pending_requests: Arc<Mutex<HashMap<(usize, u32), Instant>>>,
     ) -> Result<Self> {
-        Self::read_handshake(&mut stream, &info_hash).await?;
-        Self::write_handshake(&mut stream, &info_hash, &my_id).await?;
-        let have = BitVec::from_elem(piece_hashes.len(), false);
+        Self::read_handshake(&mut stream, &args.info_hash).await?;
+        Self::write_handshake(&mut stream, &args.info_hash, &args.my_id).await?;
+        let have = BitVec::from_elem(args.piece_hashes.len(), false);
         Ok(Self {
             peer,
-            piece_sender,
-            piece_length,
-            piece_hashes,
+            piece_sender: args.piece_sender,
+            piece_length: args.piece_length,
+            piece_hashes: args.piece_hashes,
             pending_pieces: HashMap::new(),
-            my_id,
+            my_id: args.my_id,
             stream,
             peer_bitfield: None,
             have_bitfield: Some(have),
-            am_choking: false,
-            am_interested: false,
-            peer_choking: true,
-            peer_interested: false,
-            event_tx,
+            connection_state: ConnectionStateFlags::new(),
+            event_tx: args.event_tx,
             cmd_rx,
-            downloaded,
-            uploaded,
-            read_file_handle,
-            piece_download_progress,
-            pending_requests,
+            downloaded: args.downloaded,
+            uploaded: args.uploaded,
+            read_file_handle: args.read_file_handle,
+            piece_download_progress: args.piece_download_progress,
+            pending_requests: args.pending_requests,
         })
     }
 
@@ -435,15 +391,15 @@ impl PeerConnection {
     }
 
     /// Checks interest state and sends Interested or NotInterested message if it changed.
-    async fn update_interest_state(&mut self) -> Result<()> {
+    pub(crate) async fn update_interest_state(&mut self) -> Result<()> {
         let should_be_interested = self.should_i_be_interested();
 
-        if !self.am_interested && should_be_interested {
-            self.am_interested = true;
+        if !self.connection_state.am_interested && should_be_interested {
+            self.connection_state.am_interested = true;
             trace!("Becoming interested in peer {}", self.peer.ip);
             self.send_message(Message::Interested).await?;
-        } else if self.am_interested && !should_be_interested {
-            self.am_interested = false;
+        } else if self.connection_state.am_interested && !should_be_interested {
+            self.connection_state.am_interested = false;
             trace!("Becoming not interested in peer {}", self.peer.ip);
             self.send_message(Message::NotInterested).await?;
         }
@@ -455,8 +411,8 @@ impl PeerConnection {
     /// Called externally (e.g., by Swarm) based on choking algorithm.
     // Make crate-visible so SwarmCommandHandler can call it
     pub(crate) async fn set_choking(&mut self) -> Result<()> {
-        if !self.am_choking {
-            self.am_choking = true;
+        if !self.connection_state.am_choking {
+            self.connection_state.am_choking = true;
             trace!("Choking peer {}", self.peer.ip);
             self.send_message(Message::Choke).await?;
         }
@@ -467,8 +423,8 @@ impl PeerConnection {
     /// Called externally (e.g., by Swarm) based on choking algorithm.
     // Make crate-visible so SwarmCommandHandler can call it
     pub(crate) async fn set_unchoking(&mut self) -> Result<()> {
-        if self.am_choking {
-            self.am_choking = false;
+        if self.connection_state.am_choking {
+            self.connection_state.am_choking = false;
             trace!("Unchoking peer {}", self.peer.ip);
             self.send_message(Message::Unchoke).await?;
         }

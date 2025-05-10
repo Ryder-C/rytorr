@@ -1,12 +1,11 @@
 use crate::{
     file::Piece,
     peer::{message, PeerConnection, BLOCK_SIZE},
-    swarm::{
+    swarm::tasks::event_processor::{
         BitfieldEventHandler, ChokeEventHandler, HaveEventHandler, PeerEventHandler,
         UnchokeEventHandler,
     },
 };
-use anyhow::Result;
 use async_trait::async_trait;
 use bit_vec::BitVec;
 use sha1::{Digest, Sha1};
@@ -38,7 +37,7 @@ pub(super) struct ChokeHandler;
 impl MessageHandler for ChokeHandler {
     async fn handle(&self, connection: &mut PeerConnection) {
         debug!("Received Choke");
-        connection.peer_choking = true;
+        connection.connection_state.peer_choking = true;
         let handler: Box<dyn PeerEventHandler + Send> = Box::new(ChokeEventHandler {
             peer: connection.peer.clone(),
         });
@@ -52,7 +51,7 @@ pub(super) struct UnchokeHandler;
 impl MessageHandler for UnchokeHandler {
     async fn handle(&self, connection: &mut PeerConnection) {
         debug!("Received Unchoke");
-        connection.peer_choking = false;
+        connection.connection_state.peer_choking = false;
         let handler: Box<dyn PeerEventHandler + Send> = Box::new(UnchokeEventHandler {
             peer: connection.peer.clone(),
         });
@@ -66,9 +65,9 @@ pub(super) struct InterestedHandler;
 impl MessageHandler for InterestedHandler {
     async fn handle(&self, connection: &mut PeerConnection) {
         debug!("Received Interested");
-        connection.peer_interested = true;
+        connection.connection_state.peer_interested = true;
         // TODO: Implement unchoking logic (send Unchoke if we want to serve this peer)
-        // if !connection.am_choking { ... send Unchoke ... }
+        // if !connection.connection_state.am_choking { ... send Unchoke ... }
     }
 }
 
@@ -78,7 +77,7 @@ pub(super) struct NotInterestedHandler;
 impl MessageHandler for NotInterestedHandler {
     async fn handle(&self, connection: &mut PeerConnection) {
         debug!("Received NotInterested");
-        connection.peer_interested = false;
+        connection.connection_state.peer_interested = false;
     }
 }
 
@@ -174,7 +173,7 @@ impl MessageHandler for RequestHandler {
         );
 
         // Validation
-        if connection.am_choking {
+        if connection.connection_state.am_choking {
             trace!(peer.ip = %connection.peer.ip, piece_index = self.index, "Ignoring request: We are choking peer (am_choking=true)");
             return;
         } else {

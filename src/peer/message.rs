@@ -4,8 +4,6 @@ use bit_vec::BitVec;
 // Import the handlers and the trait
 use super::handlers::*;
 
-const PSTR: &str = "BitTorrent protocol";
-
 // Message enum is removed as we now directly parse into boxed handlers
 // #[derive(Debug)]
 // pub enum Message {
