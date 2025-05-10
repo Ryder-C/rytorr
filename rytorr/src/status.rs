@@ -6,7 +6,7 @@ use crossterm::{
 };
 use std::{
     collections::HashMap,
-    io::{stdout, Stdout, Write}, // Use stdout directly
+    io::{stdout, Write}, // Use stdout directly
     sync::Arc,
     time::Duration,
 };

@@ -4,7 +4,7 @@ use std::sync::Arc;
 use super::{Trackable, TrackerResponse};
 use anyhow::{bail, Result};
 use bendy::decoding::{FromBencode, Object, ResultExt as _};
-use tracing::{debug, error, info, instrument, trace, warn};
+use tracing::{debug, error, instrument, trace, warn};
 use urlencoding::encode_binary;
 
 // Tracker parameters from bittorrent spec <https://wiki.theory.org/BitTorrentSpecification#Tracker_HTTP.2FHTTPS_Protocol>

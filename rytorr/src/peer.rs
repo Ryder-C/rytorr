@@ -8,9 +8,8 @@ use std::{hash::Hash, net::SocketAddr, sync::Arc};
 use crate::engine::PendingPeer;
 use crate::file::Piece;
 use crate::swarm::tasks::event_processor::{
-    BitfieldEventHandler, ChokeEventHandler, HaveEventHandler, LocalChokeEventHandler,
-    LocalInterestUpdateEventHandler, LocalUnchokeEventHandler, MessageSentToPeerEvent,
-    PeerEventHandler, PeerInterestedEventHandler, PeerNotInterestedEventHandler,
+    LocalChokeEventHandler, LocalInterestUpdateEventHandler, LocalUnchokeEventHandler,
+    MessageSentToPeerEvent, PeerEventHandler,
 };
 use anyhow::{ensure, Context, Result};
 use async_channel::Sender;

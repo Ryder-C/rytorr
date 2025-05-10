@@ -120,7 +120,6 @@ impl TryFrom<HttpResponse> for TrackerResponse {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::peer::Peer;
 
     #[test]
     fn test_event_display() {

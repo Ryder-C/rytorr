@@ -287,7 +287,7 @@ impl Swarm {
         );
 
         // Open file for reading AFTER ensuring disk_writer has potentially created/truncated it
-        sleep(Duration::from_millis(100)).await;
+        sleep(Duration::from_millis(100)).await; // Would probably be better to have disk_writes notify but this is fine for now
         match File::open(&file_path).await {
             Ok(file) => {
                 info!(path = %file_path, "Opened download file for reading by peers");
@@ -302,10 +302,9 @@ impl Swarm {
         // Main loop to accept new peers
         let piece_download_progress_clone = piece_download_progress.clone();
         let pending_requests_clone = pending_requests.clone();
-        let info_hash_clone = info_hash.clone(); // Clone for the loop
-        let evt_tx_clone = evt_tx.clone(); // Clone for the loop
+        let info_hash_clone = info_hash.clone();
+        let evt_tx_clone = evt_tx.clone();
 
-        // let semaphore = self.connection_semaphore.clone(); // Not needed to clone here anymore
         loop {
             debug!("Waiting for new peer...");
 
@@ -367,7 +366,6 @@ impl Swarm {
 
         info!(peer.ip = %peer_ip_for_logging, "Attempting connection in manage_peer_lifecycle");
 
-        // Create PeerConnectionArgs for PeerConnection::new
         let pc_args = crate::peer::PeerConnectionArgs {
             my_id: ctx.my_id.clone(),
             info_hash: ctx.info_hash.clone(),

@@ -211,7 +211,6 @@ mod tests {
     // For now, comment out tests that rely on matching the Message enum directly.
 
     use super::*;
-    use bit_vec::BitVec;
 
     // #[test]
     // fn test_keepalive() {

@@ -1,7 +1,7 @@
 use anyhow::{bail, Context, Result};
-use std::net::{SocketAddr, ToSocketAddrs, UdpSocket};
+use std::net::{ToSocketAddrs, UdpSocket};
 use std::sync::Arc;
-use tracing::{debug, error, info, instrument, trace, warn};
+use tracing::{debug, error, instrument, trace, warn};
 use url::Url;
 
 use super::{Trackable, MAX_PEERS};

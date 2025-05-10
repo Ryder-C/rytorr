@@ -348,10 +348,10 @@ impl PeerEventHandler for MessageSentToPeerEvent {
     async fn handle(
         &self,
         states: &Mutex<HashMap<Peer, PeerState>>,
-        global_have: &Mutex<BitVec>,
+        _global_have: &Mutex<BitVec>,
         _notify: &Notify,
     ) {
-        let num_pieces = global_have.lock().await.len();
+        // let num_pieces = global_have.lock().await.len();
         let mut states_guard = states.lock().await;
         if let Some(st) = states_guard.get_mut(&self.peer) {
             st.last_message_sent_at = self.timestamp;

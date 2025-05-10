@@ -8,7 +8,7 @@ mod tracker;
 use engine::Engine;
 use std::{env, process};
 use torrex::bencode::Torrent;
-use tracing::{error, info, warn};
+use tracing::{error, info};
 
 #[tokio::main]
 async fn main() {
