@@ -125,7 +125,7 @@ impl TorrentClient {
             };
 
             let swarm_config = SwarmConfig {
-                max_peer_connections: 50,
+                max_peer_connections: 100,
                 upload_slots: 4,
             };
 
@@ -164,7 +164,7 @@ impl TorrentClient {
     }
 
     pub fn start_tracking(&self) {
-        const LOW_PEER_THRESHOLD: usize = 5;
+        const LOW_PEER_THRESHOLD: usize = 10;
         const MIN_ANNOUNCE_INTERVAL_SECS: u64 = 30;
 
         let announce_list = self.torrent.announce_list.clone();

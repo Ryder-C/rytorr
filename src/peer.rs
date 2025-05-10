@@ -271,7 +271,6 @@ impl PeerConnection {
                 // This might be desirable for responsiveness to requests
                 biased;
                 Some(cmd_handler) = self.cmd_rx.recv() => {
-                    // Directly handle the command using the trait object
                     cmd_handler.handle(self).await;
                 }
                 read_result = self.stream.read_exact(&mut len_buf) => {
