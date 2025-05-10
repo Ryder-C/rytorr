@@ -95,10 +95,7 @@ async fn pipeline_blocks_for_piece_from_peer(
         }
 
         let block_key = (piece_idx, current_begin);
-        let is_pending = {
-            let pending_guard = pending_requests.lock().await;
-            pending_guard.contains_key(&block_key)
-        };
+        let is_pending = pending_requests.lock().await.contains_key(&block_key);
 
         if is_pending {
             trace!(
@@ -127,10 +124,11 @@ async fn pipeline_blocks_for_piece_from_peer(
             error!(error = %e, peer.ip = %peer.ip, piece_index = piece_idx, begin = current_begin, "Pipeline: Failed to send Request command handler, stopping pipeline for this peer/piece");
             break;
         } else {
-            {
-                let mut pending_guard = pending_requests.lock().await;
-                pending_guard.insert(block_key, Instant::now());
-            }
+            pending_requests
+                .lock()
+                .await
+                .insert(block_key, Instant::now());
+
             requested_any_block = true;
             blocks_requested_for_peer_piece += 1;
             current_begin += current_size;
@@ -175,12 +173,8 @@ async fn try_request_blocks_for_piece(
 
     for (peer, rate) in eligible_peers {
         trace!(peer.ip = %peer.ip, download_rate_Bps_interval = rate, piece_idx, "Considering peer for request");
-        let tx_option = {
-            let senders_map = senders.lock().await;
-            senders_map.get(&peer).cloned()
-        };
 
-        if let Some(tx) = tx_option {
+        if let Some(tx) = senders.lock().await.get(&peer).cloned() {
             // Check peer state again, as it might have changed slightly, though less likely here.
             if let Some(current_peer_state) = states.get(&peer) {
                 if current_peer_state.peer_is_choking_us {
@@ -246,13 +240,10 @@ pub(crate) async fn scheduler_loop(
         handle_request_timeouts(pending_requests.clone(), REQUEST_TIMEOUT).await;
 
         let states_guard = peer_states.lock().await;
-        let have_guard = global_have.lock().await;
+        // let have_guard = global_have.lock().await;
 
         if states_guard.is_empty() {
             debug!("Scheduler: No peers, sleeping.");
-            // Release locks before continuing
-            drop(states_guard);
-            drop(have_guard);
             continue;
         }
 
@@ -260,25 +251,21 @@ pub(crate) async fn scheduler_loop(
 
         // Release locks now that we have rarity and can work with cloned Arcs for requests
         drop(states_guard);
-        drop(have_guard);
+        // drop(have_guard);
 
         let mut requested_this_cycle = false;
         for (piece_idx, _) in rarity {
             // Re-check have status for the specific piece inside the loop, as it might change
-            let current_have = global_have.lock().await;
-            if current_have.get(piece_idx).unwrap_or(true) {
-                drop(current_have); // release lock
-                {
-                    let mut progress_guard = piece_download_progress.lock().await;
-                    progress_guard.remove(&piece_idx);
-                }
-                {
-                    let mut pending_requests_guard = pending_requests.lock().await;
-                    pending_requests_guard.retain(|(p_idx, _), _| *p_idx != piece_idx);
-                }
+            if global_have.lock().await.get(piece_idx).unwrap_or(true) {
+                piece_download_progress.lock().await.remove(&piece_idx);
+
+                pending_requests
+                    .lock()
+                    .await
+                    .retain(|(p_idx, _), _| *p_idx != piece_idx);
+
                 continue;
             }
-            drop(current_have); // release lock
 
             // We need to pass a reference to the states map for `try_request_blocks_for_piece`
             // Lock it again briefly. This is a bit of lock contention, could be optimized
@@ -297,11 +284,6 @@ pub(crate) async fn scheduler_loop(
             {
                 requested_this_cycle = true;
             }
-            drop(states_for_request); // Release lock
-                                      // NOTE: We DO NOT break the outer loop here.
-                                      // The scheduler can continue to the next piece in the rarity list,
-                                      // potentially finding work for other peers or even the same peer
-                                      // if they have other rare pieces.
         }
         if !requested_this_cycle {
             debug!("Scheduler: Did not request any blocks this cycle.");

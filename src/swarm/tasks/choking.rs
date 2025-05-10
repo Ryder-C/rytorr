@@ -39,8 +39,6 @@ pub(crate) async fn choking_loop(
 
         if active_peers.is_empty() {
             trace!("No peers to evaluate, skipping choke cycle.");
-            drop(states_map_guard); // Release locks
-            drop(senders_map_guard);
             continue;
         }
 
@@ -144,18 +142,18 @@ pub(crate) async fn choking_loop(
             if state.am_choking_peer == should_be_unchoked {
                 // Current state is am_choking_peer=true, should_be_unchoked=true (means we need to unchoke)
                 // OR am_choking_peer=false, should_be_unchoked=false (means we need to choke)
-                let command_to_send: Box<dyn handlers::SwarmCommandHandler + Send>;
-                if should_be_unchoked {
-                    // We are currently choking them (am_choking_peer=true by deduction), but we want to unchoke them.
-                    trace!(peer.ip = %peer.ip, "ChokingLoop: Sending Unchoke command");
-                    command_to_send = Box::new(UnchokePeerCommand);
-                    state.am_choking_peer = false; // Update our state reflection
-                } else {
-                    // We are currently not choking them (am_choking_peer=false by deduction), but we want to choke them.
-                    trace!(peer.ip = %peer.ip, "ChokingLoop: Sending Choke command");
-                    command_to_send = Box::new(ChokePeerCommand);
-                    state.am_choking_peer = true; // Update our state reflection
-                }
+                let command_to_send: Box<dyn handlers::SwarmCommandHandler + Send> =
+                    if should_be_unchoked {
+                        // We are currently choking them (am_choking_peer=true by deduction), but we want to unchoke them.
+                        trace!(peer.ip = %peer.ip, "ChokingLoop: Sending Unchoke command");
+                        state.am_choking_peer = false; // Update our state reflection
+                        Box::new(UnchokePeerCommand)
+                    } else {
+                        // We are currently not choking them (am_choking_peer=false by deduction), but we want to choke them.
+                        trace!(peer.ip = %peer.ip, "ChokingLoop: Sending Choke command");
+                        state.am_choking_peer = true; // Update our state reflection
+                        Box::new(ChokePeerCommand)
+                    };
 
                 if let Some(tx) = senders_map_guard.get(peer) {
                     if let Err(e) = tx.send(command_to_send) {
@@ -169,10 +167,6 @@ pub(crate) async fn choking_loop(
             // Snapshot rates for next cycle AFTER decisions but before releasing lock
             state.end_choke_cycle_snapshot();
         }
-
-        // Drop locks before sleeping or next iteration
-        drop(states_map_guard);
-        drop(senders_map_guard);
     }
     // warn!("Choking loop finished unexpectedly"); // Should not happen
 }
