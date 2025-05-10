@@ -8,8 +8,9 @@ use std::{hash::Hash, net::SocketAddr, sync::Arc};
 use crate::engine::PendingPeer;
 use crate::file::Piece;
 use crate::swarm::tasks::event_processor::{
-    LocalChokeEventHandler, LocalInterestUpdateEventHandler, LocalUnchokeEventHandler,
-    PeerEventHandler,
+    BitfieldEventHandler, ChokeEventHandler, HaveEventHandler, LocalChokeEventHandler,
+    LocalInterestUpdateEventHandler, LocalUnchokeEventHandler, MessageSentToPeerEvent,
+    PeerEventHandler, PeerInterestedEventHandler, PeerNotInterestedEventHandler,
 };
 use anyhow::{ensure, Context, Result};
 use async_channel::Sender;
@@ -310,10 +311,21 @@ impl PeerConnection {
         info!(peer.ip = %self.peer.ip, "Peer connection loop finished");
     }
 
-    #[tracing::instrument(skip(self, message), fields(message_type = std::any::type_name::<message::Message>()))]
+    #[tracing::instrument(skip(self, message), fields(message_type = ?message.to_str()))]
     pub(crate) async fn send_message(&mut self, message: message::Message) -> Result<()> {
         let payload = message.to_be_bytes();
         self.stream.write_all(&payload).await?;
+
+        // After successful send, emit event to update last_message_sent_at
+        let event: Box<dyn PeerEventHandler + Send> = Box::new(MessageSentToPeerEvent {
+            peer: self.peer.clone(),
+            timestamp: Instant::now(),
+        });
+        if self.event_tx.send(event).is_err() {
+            // Log error, but don't let this fail the send_message operation itself
+            error!(peer.ip = %self.peer.ip, "Failed to send MessageSentToPeerEvent to event loop");
+        }
+
         Ok(())
     }
 

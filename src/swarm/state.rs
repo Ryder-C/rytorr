@@ -1,6 +1,5 @@
-use crate::peer::Peer;
 use bit_vec::BitVec;
-use std::sync::Arc;
+use std::time::Instant;
 
 /// Per-peer state tracked by the Swarm
 #[derive(Clone, Debug)]
@@ -15,6 +14,8 @@ pub(crate) struct PeerState {
     pub(crate) total_downloaded_from_peer: u64,
     pub(crate) last_choke_cycle_uploaded: u64,
     pub(crate) last_choke_cycle_downloaded: u64,
+
+    pub(crate) last_message_sent_at: Instant,
 }
 
 impl PeerState {
@@ -29,6 +30,7 @@ impl PeerState {
             total_downloaded_from_peer: 0,
             last_choke_cycle_uploaded: 0,
             last_choke_cycle_downloaded: 0,
+            last_message_sent_at: Instant::now(),
         }
     }
 

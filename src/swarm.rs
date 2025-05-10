@@ -177,6 +177,12 @@ impl Swarm {
             ctx.peer_states.clone(),
             upload_slots_for_choking,
         ));
+
+        info!("Spawning KeepAlive loop");
+        tokio::spawn(tasks::keep_alive::keep_alive_loop(
+            ctx.peer_cmd_senders.clone(),
+            ctx.peer_states.clone(),
+        ));
     }
 
     #[instrument(skip_all)]

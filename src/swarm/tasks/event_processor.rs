@@ -1,5 +1,6 @@
 use std::collections::HashMap;
 use std::sync::Arc;
+use std::time::Instant;
 
 use async_trait::async_trait;
 use bit_vec::BitVec;
@@ -332,6 +333,39 @@ impl PeerEventHandler for PeerReceivedBlockEventHandler {
         st.total_downloaded_from_peer += self.bytes;
         // No notify needed, scheduler/choker will read this periodically
         trace!(peer.ip = %self.peer.ip, bytes = self.bytes, total_downloaded = st.total_downloaded_from_peer, "EventLoop: Updated downloaded bytes from peer");
+    }
+}
+
+// New event for when a message is sent to a peer
+#[derive(Debug)]
+pub(crate) struct MessageSentToPeerEvent {
+    pub(crate) peer: Peer,
+    pub(crate) timestamp: Instant,
+}
+
+#[async_trait]
+impl PeerEventHandler for MessageSentToPeerEvent {
+    async fn handle(
+        &self,
+        states: &Mutex<HashMap<Peer, PeerState>>,
+        global_have: &Mutex<BitVec>,
+        _notify: &Notify,
+    ) {
+        let num_pieces = global_have.lock().await.len();
+        let mut states_guard = states.lock().await;
+        if let Some(st) = states_guard.get_mut(&self.peer) {
+            st.last_message_sent_at = self.timestamp;
+            trace!(peer.ip = %self.peer.ip, at = ?self.timestamp, "EventLoop: Updated last_message_sent_at for peer");
+        } else {
+            // This might happen if peer disconnects and its state is removed right before this event is processed.
+            // Or if it's a very new peer and state isn't created yet (though less likely for a *sent* message event).
+            // For robustness, we could create the state, but it might be for a peer that's already gone.
+            // Let's log it for now.
+            debug!(peer.ip = %self.peer.ip, "EventLoop: Received MessageSentToPeerEvent for peer not in state map (might have disconnected)");
+            // Optionally, create state if it's critical that this is recorded:
+            // let st = states_guard.entry(self.peer.clone()).or_insert_with(|| PeerState::new(num_pieces));
+            // st.last_message_sent_at = self.timestamp;
+        }
     }
 }
 

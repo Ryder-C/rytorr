@@ -77,6 +77,23 @@ impl Message {
             Message::Port(port) => Self::encode_msg(9, &port.to_be_bytes()),
         }
     }
+
+    // Helper to get a string representation for logging/tracing
+    pub fn to_str(&self) -> &'static str {
+        match self {
+            Message::KeepAlive => "KeepAlive",
+            Message::Choke => "Choke",
+            Message::Unchoke => "Unchoke",
+            Message::Interested => "Interested",
+            Message::NotInterested => "NotInterested",
+            Message::Have(_) => "Have",
+            Message::Bitfield(_) => "Bitfield",
+            Message::Request(_, _, _) => "Request",
+            Message::Piece(_, _, _) => "Piece",
+            Message::Cancel(_, _, _) => "Cancel",
+            Message::Port(_) => "Port",
+        }
+    }
 }
 
 // --- Payload Parsing Helper Functions ---

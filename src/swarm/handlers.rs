@@ -92,3 +92,21 @@ impl SwarmCommandHandler for UnchokePeerCommand {
         }
     }
 }
+
+/// Command sent from Swarm to a PeerConnection task to send a KeepAlive message.
+#[derive(Debug)]
+pub(crate) struct SendKeepAliveCommand;
+
+#[async_trait]
+impl SwarmCommandHandler for SendKeepAliveCommand {
+    async fn handle(&self, connection: &mut PeerConnection) {
+        debug!(peer.ip = %connection.peer.ip, "Handling SendKeepAliveCommand, sending KeepAlive message");
+        if let Err(e) = connection
+            .send_message(crate::peer::message::Message::KeepAlive)
+            .await
+        {
+            error!(error = %e, peer.ip = %connection.peer.ip, "Failed to send KeepAlive message via SendKeepAliveCommand");
+        }
+        // The send_message call itself will trigger an event to update last_message_sent_at.
+    }
+}
