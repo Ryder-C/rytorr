@@ -11,6 +11,7 @@ use torrex::bencode::Torrent;
 
 use crate::{
     peer::Peer,
+    dht::DhtNode,
     status,
     swarm::{PeerMapArc, Swarm, SwarmArgs, SwarmConfig},
     tracker::{http, udp, Trackable, TrackerType},
@@ -308,6 +309,38 @@ impl TorrentClient {
         }
     }
 
+    pub fn start_dht(&self) {
+        const DHT_QUERY_INTERVAL_SECS: u64 = 300;
+
+        let info_hash = self.torrent.info.hash;
+        let sender = self.peer_sender.clone();
+        let port = self.port;
+
+        tokio::spawn(async move {
+            let dht = match DhtNode::new().await {
+                Ok(d) => d,
+                Err(e) => {
+                    error!(error = %e, "Failed to start DHT node");
+                    return;
+                }
+            };
+
+            dht.announce(info_hash, port).await;
+
+            loop {
+                let peers = dht.get_peers(info_hash).await;
+                for addr in peers {
+                    let sock = std::net::SocketAddr::V4(addr);
+                    let peer = Peer::from_socket_address(sock);
+                    if let Err(e) = sender.send(PendingPeer::Outgoing(peer)).await {
+                        error!(error = %e, "Failed to send DHT peer to swarm");
+                    }
+                }
+                tokio::time::sleep(Duration::from_secs(DHT_QUERY_INTERVAL_SECS)).await;
+            }
+        });
+    }
+
     fn create_tracker(
         url: String,
         info_hash: Arc<Vec<u8>>,
@@ -357,6 +390,7 @@ impl Engine {
             .insert(info_hash, client.clone());
 
         client.start_tracking();
+        client.start_dht();
 
         Ok(())
     }
