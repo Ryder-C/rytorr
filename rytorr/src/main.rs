@@ -4,6 +4,7 @@ mod peer;
 mod status;
 mod swarm;
 mod tracker;
+mod dht;
 
 use engine::Engine;
 use std::{env, process};

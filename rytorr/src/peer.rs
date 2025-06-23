@@ -336,7 +336,10 @@ impl PeerConnection {
         let mut buf = [0u8; 49 + Self::PSTR.len()];
         buf[0] = Self::PSTR.len() as u8;
         buf[1..(1 + Self::PSTR.len())].copy_from_slice(Self::PSTR.as_bytes());
-        buf[(1 + Self::PSTR.len())..(1 + Self::PSTR.len() + 8)].copy_from_slice(&[0u8; 8]); // Reserved 8 bytes
+        let mut reserved = [0u8; 8];
+        // Indicate DHT support by setting the last bit of the reserved field (BEP 0005)
+        reserved[7] |= 0x01;
+        buf[(1 + Self::PSTR.len())..(1 + Self::PSTR.len() + 8)].copy_from_slice(&reserved);
         buf[(1 + Self::PSTR.len() + 8)..(1 + Self::PSTR.len() + 8 + info_hash.len())]
             .copy_from_slice(info_hash); // Info hash 20 bytes
         buf[(1 + Self::PSTR.len() + 8 + info_hash.len())
